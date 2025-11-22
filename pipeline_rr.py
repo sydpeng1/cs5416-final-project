@@ -25,9 +25,9 @@ import requests  # ← 新增，用于 Node0 转发请求
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 3))
 NODE_NUMBER = int(os.environ.get('NODE_NUMBER', 0))
-NODE_0_IP = os.environ.get('NODE_0_IP', 'localhost:5243')  # host:port
-NODE_1_IP = os.environ.get('NODE_1_IP', 'localhost:5244')
-NODE_2_IP = os.environ.get('NODE_2_IP', 'localhost:5255')
+NODE_0_IP = os.environ.get('NODE_0_IP', '132.236.91.188:5243')  # host:port
+NODE_1_IP = os.environ.get('NODE_1_IP', '132.236.91.255:5244')
+NODE_2_IP = os.environ.get('NODE_2_IP', '132.236.91.186:5255')
 FAISS_INDEX_PATH = os.environ.get('FAISS_INDEX_PATH', 'faiss_index.bin')
 DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
