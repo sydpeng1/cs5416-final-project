@@ -181,6 +181,7 @@ class Node2Generation:
                 "sentiment": sent,
                 "is_toxic": "true" if tox else "false",
             }
+            print(f"[Node2] Sending batch to Node0, request_ids={req_ids}")
             self.send_callback_to_node0(rid, result)
 
 

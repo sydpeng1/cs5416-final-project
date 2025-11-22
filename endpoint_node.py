@@ -67,7 +67,7 @@ class Node0Pipeline:
         )
         return embeddings.astype("float32")
 
-    def send_to_node1(self, requests: List[PipelineRequest], embeddings: np.ndarray):
+    def send_to_node1(self, reqs: List[PipelineRequest], embeddings: np.ndarray):
         payload = {
             "requests": [
                 {
@@ -75,10 +75,12 @@ class Node0Pipeline:
                     "query": r.query,
                     "embedding": embeddings[i].tolist(),
                 }
-                for i, r in enumerate(requests)
+                for i, r in enumerate(reqs)
             ],
             "retrieval_k": CONFIG["retrieval_k"],
         }
+
+        import requests
 
         url = f"http://{NODE_1_IP}/search_and_rerank_batch"
         try:

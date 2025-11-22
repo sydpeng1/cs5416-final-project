@@ -163,6 +163,7 @@ class Node1Retrieval:
         # Rerank
         reranked_batch = self._rerank_documents_batch(queries, docs_batch)
         # Send to Node2
+        print(f"[Node1] Step: Sending batch to Node2, request_ids={req_ids}")
         self.send_to_node2(req_ids, queries, reranked_batch)
 
         elapsed = time.time() - t0
