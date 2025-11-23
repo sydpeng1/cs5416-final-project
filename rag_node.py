@@ -15,9 +15,14 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # ------------- Env & Config -------------
 TOTAL_NODES = int(os.environ.get("TOTAL_NODES", 1))
-NODE_NUMBER = int(os.environ.get("NODE_NUMBER", 1))
+NODE_NUMBER = int(os.environ.get("NODE_NUMBER", 1))  # 1 或 2
+NODE_0_IP = os.environ.get("NODE_0_IP", "127.0.0.1:8000")
 NODE_1_IP = os.environ.get("NODE_1_IP", "127.0.0.1:8001")
 NODE_2_IP = os.environ.get("NODE_2_IP", "127.0.0.1:8002")
+
+# 自己监听的 IP/端口（同一份代码在 node1 / node2 跑）
+MY_IP = NODE_1_IP if NODE_NUMBER == 1 else NODE_2_IP
+
 FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "faiss_index.bin")
 DOCUMENTS_DIR = os.environ.get("DOCUMENTS_DIR", "documents/")
 
@@ -37,28 +42,27 @@ app = Flask(__name__)
 request_queue: "Queue[Dict[str, Any]]" = Queue()
 
 
-class Node1Retrieval:
+class RagNode:
     """
-    Node1:
+    Node1 / Node2 通用：
     - 收到 Node0 的 embedding + query
     - FAISS 搜索 + SQLite 取文档 + Rerank
-    - 把 (query, reranked_docs) 发给 Node2
-    - 不负责等待、也不直接回给 Node0
+    - 把 (request_id, query, reranked_docs, nodeId) 回调给 Node0 的 /callback
     """
 
     def __init__(self):
         self.device = torch.device("cpu")
-        print(f"[Node1] Initializing on {self.device}")
-        print(f"[Node1] FAISS index: {FAISS_INDEX_PATH}")
-        print(f"[Node1] Documents DB dir: {DOCUMENTS_DIR}")
+        print(f"[RAG Node {NODE_NUMBER}] Initializing on {self.device}")
+        print(f"[RAG Node {NODE_NUMBER}] FAISS index: {FAISS_INDEX_PATH}")
+        print(f"[RAG Node {NODE_NUMBER}] Documents DB dir: {DOCUMENTS_DIR}")
 
         if not os.path.exists(FAISS_INDEX_PATH):
-            raise FileNotFoundError("[Node1] FAISS index not found.")
-        print("[Node1] Loading FAISS index...")
+            raise FileNotFoundError("[RAG Node] FAISS index not found.")
+        print("[RAG Node] Loading FAISS index...")
         self.index = faiss.read_index(FAISS_INDEX_PATH)
 
         self.reranker_model_name = "BAAI/bge-reranker-base"
-        print(f"[Node1] Loading reranker: {self.reranker_model_name}")
+        print(f"[RAG Node] Loading reranker: {self.reranker_model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             self.reranker_model_name
@@ -67,6 +71,7 @@ class Node1Retrieval:
 
         self.db_path = os.path.join(DOCUMENTS_DIR, "documents.db")
 
+    # ---------- FAISS + SQLite + rerank ----------
     def _faiss_search_batch(self, embeddings: np.ndarray) -> List[List[int]]:
         embeddings = embeddings.astype("float32")
         _, indices = self.index.search(embeddings, CONFIG["retrieval_k"])
@@ -83,7 +88,8 @@ class Node1Retrieval:
             docs = []
             for doc_id in doc_ids:
                 cursor.execute(
-                    "SELECT doc_id, title, content, category FROM documents WHERE doc_id = ?",
+                    "SELECT doc_id, title, content, category "
+                    "FROM documents WHERE doc_id = ?",
                     (doc_id,),
                 )
                 result = cursor.fetchone()
@@ -128,23 +134,33 @@ class Node1Retrieval:
 
         return reranked_batches
 
-    def send_to_node2(
+    # ---------- 回调 Node0 ----------
+    def send_callback_to_node0(
         self, req_ids: List[str], queries: List[str], docs_batch: List[List[Dict]]
     ):
-        payload = {
-            "requests": [
-                {"request_id": rid, "query": q, "documents": docs}
-                for rid, q, docs in zip(req_ids, queries, docs_batch)
-            ]
-        }
-        url = f"http://{NODE_2_IP}/generate_batch"
-        try:
-            resp = requests.post(url, json=payload, timeout=300)
-            if resp.status_code != 200:
-                print(f"[Node1] Node2 returned {resp.status_code}: {resp.text}")
-        except Exception as e:
-            print(f"[Node1] Error sending batch to Node2: {e}")
+        url = f"http://{NODE_0_IP}/callback"
+        for rid, q, docs in zip(req_ids, queries, docs_batch):
+            payload = {
+                "request_id": rid,
+                "query": q,
+                "documents": docs,
+                "nodeId": NODE_NUMBER,
+            }
+            try:
+                resp = requests.post(url, json=payload, timeout=30)
+                if resp.status_code != 200:
+                    print(
+                        f"[RAG Node {NODE_NUMBER}] Callback to Node0 failed "
+                        f"for {rid}: {resp.status_code} {resp.text}"
+                    )
+                else:
+                    print(f"[RAG Node {NODE_NUMBER}] Callback OK for {rid} → Node0")
+            except Exception as e:
+                print(
+                    f"[RAG Node {NODE_NUMBER}] Error callback to Node0 for {rid}: {e}"
+                )
 
+    # ---------- 整个 batch 流程 ----------
     def process_batch(self, batch_items: List[Dict[str, Any]]):
         if not batch_items:
             return
@@ -153,24 +169,23 @@ class Node1Retrieval:
         queries = [it["query"] for it in batch_items]
         embeddings = np.array([it["embedding"] for it in batch_items], dtype="float32")
 
-        print(f"\n[Node1] Processing batch size={len(batch_items)}")
+        print(f"\n[RAG Node {NODE_NUMBER}] Processing batch size={len(batch_items)}")
         t0 = time.time()
 
-        # FAISS
+        # 1. FAISS
         doc_ids_batch = self._faiss_search_batch(embeddings)
-        # Fetch docs
+        # 2. Fetch docs
         docs_batch = self._fetch_documents_batch(doc_ids_batch)
-        # Rerank
+        # 3. Rerank
         reranked_batch = self._rerank_documents_batch(queries, docs_batch)
-        # Send to Node2
-        print(f"[Node1] Step: Sending batch to Node2, request_ids={req_ids}")
-        self.send_to_node2(req_ids, queries, reranked_batch)
+        # 4. Callback Node0（RAG 结果）
+        self.send_callback_to_node0(req_ids, queries, reranked_batch)
 
         elapsed = time.time() - t0
-        print(f"[Node1] Batch dispatched to Node2 in {elapsed:.2f}s")
+        print(f"[RAG Node {NODE_NUMBER}] Batch finished in {elapsed:.2f}s")
 
 
-node1 = Node1Retrieval()
+rag_node = RagNode()
 
 
 def batch_worker():
@@ -182,6 +197,7 @@ def batch_worker():
         batch = [item]
         first_t = item["timestamp"]
 
+        # opportunistic batching
         while len(batch) < BATCH_MAX_SIZE:
             try:
                 wait_left = BATCH_MAX_WAIT - (time.time() - first_t)
@@ -195,14 +211,15 @@ def batch_worker():
                 break
 
         try:
-            node1.process_batch(batch)
+            rag_node.process_batch(batch)
         except Exception as e:
-            print(f"[Node1] Error processing batch: {e}")
+            print(f"[RAG Node {NODE_NUMBER}] Error processing batch: {e}")
         finally:
             for _ in batch:
                 request_queue.task_done()
 
 
+# ---------- Node0 调用入口 ----------
 @app.route("/search_and_rerank_batch", methods=["POST"])
 def search_and_rerank_batch():
     data = request.json or {}
@@ -220,7 +237,7 @@ def search_and_rerank_batch():
             }
         )
 
-    # Node1 不等 Node2，直接 ACK
+    # 异步处理，立即 ACK
     return jsonify({"status": "accepted"}), 200
 
 
@@ -234,14 +251,16 @@ def health():
 
 def main():
     print("=" * 60)
-    print("NODE1 RETRIEVAL (FAISS + DOCS + RERANK → Node2)")
+    print(f"RAG NODE {NODE_NUMBER} (FAISS + DOCS + RERANK → callback Node0)")
     print("=" * 60)
-    print(f"[Node1] Listening on {NODE_1_IP}, calling Node2 at {NODE_2_IP}")
+    print(
+        f"[RAG Node {NODE_NUMBER}] Listening on {MY_IP}, callback Node0 at {NODE_0_IP}"
+    )
 
     worker = threading.Thread(target=batch_worker, daemon=True)
     worker.start()
 
-    host, port = NODE_1_IP.split(":")
+    host, port = MY_IP.split(":")
     app.run(host=host, port=int(port), threaded=True)
 
 

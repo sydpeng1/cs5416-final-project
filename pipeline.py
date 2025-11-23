@@ -19,9 +19,9 @@ elif NODE_NUMBER == 1:
 
 elif NODE_NUMBER == 2:
     print("[pipeline.py] Launching Node2 generator...")
-    import llm_node
+    import rag_node
 
-    llm_node.main()
+    rag_node.main()
 
 else:
     print(f"[pipeline.py] ERROR: Unknown NODE_NUMBER={NODE_NUMBER}")
