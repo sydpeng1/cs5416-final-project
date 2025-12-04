@@ -22,8 +22,8 @@ NODE_0_IP_RAW = os.environ.get('NODE_0_IP', 'localhost:8000')
 NODE_1_IP_RAW = os.environ.get('NODE_1_IP', 'localhost:8001')  # Default to 8001
 NODE_2_IP_RAW = os.environ.get('NODE_2_IP', 'localhost:8002')  # Default to 8002
 
-BATCH_SIZE = 8
-BATCH_TIMEOUT = 0.1
+BATCH_SIZE = 16
+BATCH_TIMEOUT = 0.5
 TRUNCATE_LENGTH = 512
 
 # Flask App
