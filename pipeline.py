@@ -15,11 +15,14 @@ from transformers import (
     AutoModelForCausalLM
 )
 from transformers import pipeline as hf_pipeline
-import warnings
 from sentence_transformers import SentenceTransformer
 from flask import Flask, request, jsonify
 from queue import Queue
 import threading
+from collections import deque
+import logging
+
+from metrics import MetricsCollector, StepSampler, StepMetrics
 
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
@@ -37,11 +40,18 @@ CONFIG = {
     'faiss_dim': 768, #You must use this dimension
     'max_tokens': 128, #You must use this max token limit
     'retrieval_k': 10, #You must retrieve this many documents from the FAISS index
-    'truncate_length': 512 # You must use this truncate length
+    'truncate_length': 512, # You must use this truncate length
+    'enable_metrics': True,
+    'metrics_file_path': 'metrics.jsonl',
+    'metrics_summary_file_path': 'metrics_summary.jsonl',
+    'metrics_flush_interval_s': 10.0,
+    'metrics_sample_interval_s': 0.02,
+    'metrics_flush_after_batch': True
 }
 
 # Flask app
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 # Request queue and results storage
 request_queue = Queue()
@@ -81,6 +91,19 @@ class MonolithicPipeline:
         self.llm_model_name = 'Qwen/Qwen2.5-0.5B-Instruct'
         self.sentiment_model_name = 'nlptown/bert-base-multilingual-uncased-sentiment'
         self.safety_model_name = 'unitary/toxic-bert'
+        # Metrics
+        self.metrics = MetricsCollector(
+            enable_metrics=CONFIG.get('enable_metrics', True),
+            metrics_file_path=CONFIG.get('metrics_file_path', 'metrics.jsonl'),
+            metrics_summary_file_path=CONFIG.get('metrics_summary_file_path', 'metrics_summary.jsonl'),
+            metrics_flush_interval_s=CONFIG.get('metrics_flush_interval_s', 10.0),
+            metrics_sample_interval_s=CONFIG.get('metrics_sample_interval_s', 0.02),
+            immediate_flush=CONFIG.get('metrics_flush_after_batch', False),
+        )
+        self.metrics.start()
+        # Track completed request timestamps for throughput (rpm)
+        self._completion_times = deque()
+        self._throughput_file = 'throughput.jsonl'
     
     def process_request(self, request: PipelineRequest) -> PipelineResponse:
         """
@@ -109,37 +132,92 @@ class MonolithicPipeline:
         
         # Step 1: Generate embeddings
         print("\n[Step 1/7] Generating embeddings for batch...")
-        query_embeddings = self._generate_embeddings_batch(queries)
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            query_embeddings = self._generate_embeddings_batch(queries)
+        self._record_step_metrics(
+            step_name='generate_embeddings',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=[req.request_id for req in requests]
+        )
 
         # Step 2: FAISS ANN search
         print("\n[Step 2/7] Performing FAISS ANN search for batch...")
-        doc_id_batches = self._faiss_search_batch(query_embeddings)
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            doc_id_batches = self._faiss_search_batch(
+                query_embeddings,
+                request_ids=[req.request_id for req in requests],
+                batch_size=batch_size,
+            )
+        self._record_step_metrics(
+            step_name='faiss_search',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=[req.request_id for req in requests]
+        )
 
         # Step 3: Fetch documents from disk
         print("\n[Step 3/7] Fetching documents for batch...")
-        documents_batch = self._fetch_documents_batch(doc_id_batches)
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            documents_batch = self._fetch_documents_batch(doc_id_batches)
+        self._record_step_metrics(
+            step_name='fetch_documents',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=[req.request_id for req in requests]
+        )
 
         # Step 4: Rerank documents
         print("\n[Step 4/7] Reranking documents for batch...")
-        reranked_docs_batch = self._rerank_documents_batch(
-            queries,
-            documents_batch
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            reranked_docs_batch = self._rerank_documents_batch(
+                queries,
+                documents_batch
+            )
+        self._record_step_metrics(
+            step_name='rerank_documents',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=[req.request_id for req in requests]
         )
 
         # Step 5: Generate LLM responses
         print("\n[Step 5/7] Generating LLM responses for batch...")
-        responses_text = self._generate_responses_batch(
-            queries,
-            reranked_docs_batch
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            responses_text = self._generate_responses_batch(
+                queries,
+                reranked_docs_batch,
+                request_ids=[req.request_id for req in requests],
+                batch_size=batch_size,
+            )
+        self._record_step_metrics(
+            step_name='generate_responses',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=[req.request_id for req in requests]
         )
 
         # Step 6: Sentiment analysis
         print("\n[Step 6/7] Analyzing sentiment for batch...")
-        sentiments = self._analyze_sentiment_batch(responses_text)
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            sentiments = self._analyze_sentiment_batch(responses_text)
+        self._record_step_metrics(
+            step_name='analyze_sentiment',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=[req.request_id for req in requests]
+        )
 
         # Step 7: Safety filter on responses
         print("\n[Step 7/7] Applying safety filter to batch...")
-        toxicity_flags = self._filter_response_safety_batch(responses_text)
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            toxicity_flags = self._filter_response_safety_batch(responses_text)
+        self._record_step_metrics(
+            step_name='safety_filter',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=[req.request_id for req in requests]
+        )
         
         responses = []
         for idx, request in enumerate(requests):
@@ -153,8 +231,46 @@ class MonolithicPipeline:
                 is_toxic=sensitivity_result,
                 processing_time=processing_time
             ))
-        
+            # Update throughput (requests per minute)
+            try:
+                now = time.time()
+                self._completion_times.append(now)
+                # prune entries older than 60s
+                cutoff = now - 60.0
+                while self._completion_times and self._completion_times[0] < cutoff:
+                    self._completion_times.popleft()
+                rpm = len(self._completion_times)
+                # Append to throughput.jsonl
+                with open(self._throughput_file, 'a') as tf:
+                    tf.write(json.dumps({'timestamp': now, 'rpm': rpm}) + "\n")
+                logging.info(f"[metrics] throughput rpm={rpm}")
+            except Exception as e:
+                logging.warning(f"throughput update failed: {e}")
+        # Immediate flush of metrics after batch completes (if enabled)
+        try:
+            if CONFIG.get('metrics_flush_after_batch', False):
+                self.metrics.flush()
+        except Exception:
+            pass
+
         return responses
+
+    def _record_step_metrics(self, step_name: str, sampler: StepSampler, batch_size: int, request_ids: List[str]):
+        try:
+            m = StepMetrics(
+                step_name=step_name,
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=batch_size,
+                request_ids=request_ids,
+                duration_ms=sampler.time_samples_ms[-1] if sampler.time_samples_ms else 0.0,
+                rss_samples_mb=sampler.rss_samples_mb,
+                rss_aggregates=sampler.rss_aggregates,
+            )
+            self.metrics.record_step(m)
+            logging.info(f"[metrics] {step_name} duration_ms={m.duration_ms:.2f} rss_avg_mb={m.rss_aggregates['avg']:.2f}")
+        except Exception as e:
+            logging.warning(f"metrics record failed for {step_name}: {e}")
     
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries"""
@@ -168,17 +284,40 @@ class MonolithicPipeline:
         gc.collect()
         return embeddings
     
-    def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
+    def _faiss_search_batch(self, query_embeddings: np.ndarray, request_ids: List[str], batch_size: int) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings"""
         if not os.path.exists(CONFIG['faiss_index_path']):
             raise FileNotFoundError("FAISS index not found. Please create the index before running the pipeline.")
         
         print("Loading FAISS index")
-        index = faiss.read_index(CONFIG['faiss_index_path'])
-        query_embeddings = query_embeddings.astype('float32')
-        _, indices = index.search(query_embeddings, CONFIG['retrieval_k'])
-        del index
-        gc.collect()
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            index = faiss.read_index(CONFIG['faiss_index_path'])
+        self._record_step_metrics(
+            step_name='faiss_search.load_index',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
+
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            query_embeddings = query_embeddings.astype('float32')
+            _, indices = index.search(query_embeddings, CONFIG['retrieval_k'])
+        self._record_step_metrics(
+            step_name='faiss_search.search',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
+
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            del index
+            gc.collect()
+        self._record_step_metrics(
+            step_name='faiss_search.cleanup',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
         return [row.tolist() for row in indices]
     
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
@@ -233,41 +372,93 @@ class MonolithicPipeline:
         gc.collect()
         return reranked_batches
     
-    def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
+    def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]], request_ids: List[str], batch_size: int) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
-        model = AutoModelForCausalLM.from_pretrained(
-            self.llm_model_name,
-            dtype=torch.float16,
-        ).to(self.device)
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.llm_model_name,
+                dtype=torch.float16,
+            ).to(self.device)
+            tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+        self._record_step_metrics(
+            step_name='generate_responses.load_model',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
         responses = []
-        for query, documents in zip(queries, documents_batch):
-            context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
-            messages = [
-                {"role": "system",
-                 "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
-                {"role": "user",
-                 "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
-            ]
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        # Prepare prompts
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            texts = []
+            for query, documents in zip(queries, documents_batch):
+                context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
+                messages = [
+                    {"role": "system",
+                     "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
+                    {"role": "user",
+                     "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
+                ]
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                texts.append(text)
+        self._record_step_metrics(
+            step_name='generate_responses.prepare_prompts',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
+
+        # Tokenize
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            model_inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
+        self._record_step_metrics(
+            step_name='generate_responses.tokenize',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
+
+        # Generate
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
             generated_ids = model.generate(
                 **model_inputs,
                 max_new_tokens=CONFIG['max_tokens'],
                 temperature=0.01,
                 pad_token_id=tokenizer.eos_token_id
             )
-            generated_ids = [
+        self._record_step_metrics(
+            step_name='generate_responses.generate',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
+
+        # Slice and decode
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            sliced_ids = [
                 output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            responses.append(response)
-        del model, tokenizer
-        gc.collect()
+            decoded = tokenizer.batch_decode(sliced_ids, skip_special_tokens=True)
+            responses.extend(decoded)
+        self._record_step_metrics(
+            step_name='generate_responses.decode',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
+
+        with StepSampler(CONFIG['metrics_sample_interval_s']) as sampler:
+            del model, tokenizer
+            gc.collect()
+        self._record_step_metrics(
+            step_name='generate_responses.cleanup',
+            sampler=sampler,
+            batch_size=batch_size,
+            request_ids=request_ids,
+        )
         return responses
     
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
@@ -323,12 +514,30 @@ def process_requests_worker():
                 break
             
             # Create request object
+            start_processing_ts = time.time()
             req = PipelineRequest(
                 request_id=request_data['request_id'],
                 query=request_data['query'],
-                timestamp=time.time()
+                timestamp=start_processing_ts
             )
-            
+            try:
+                enqueue_ts = request_data.get('enqueue_ts')
+                if enqueue_ts is not None:
+                    queue_wait_s = max(0.0, start_processing_ts - float(enqueue_ts))
+                    m_wait = StepMetrics(
+                        step_name='request_queue_wait',
+                        node_number=NODE_NUMBER,
+                        timestamp=time.time(),
+                        batch_size=1,
+                        request_ids=[req.request_id],
+                        duration_ms=queue_wait_s * 1000.0,
+                        rss_samples_mb=[],
+                        rss_aggregates={'min': 0.0, 'max': 0.0, 'avg': 0.0, 'std': 0.0},
+                    )
+                    pipeline.metrics.record_step(m_wait)
+            except Exception as e:
+                logging.warning(f"metrics record failed before processing (queue wait): {e}")
+
             # Process request
             response = pipeline.process_request(req)
             
@@ -340,6 +549,25 @@ def process_requests_worker():
                     'sentiment': response.sentiment,
                     'is_toxic': response.is_toxic
                 }
+            # Metrics: total latency (queue wait + processing) recorded AFTER processing
+            try:
+                enqueue_ts = request_data.get('enqueue_ts')
+                if enqueue_ts is not None:
+                    queue_wait_s = max(0.0, start_processing_ts - float(enqueue_ts))
+                    total_latency_ms = queue_wait_s * 1000.0 + response.processing_time * 1000.0
+                    m_total = StepMetrics(
+                        step_name='request_total',
+                        node_number=NODE_NUMBER,
+                        timestamp=time.time(),
+                        batch_size=1,
+                        request_ids=[response.request_id],
+                        duration_ms=total_latency_ms,
+                        rss_samples_mb=[],
+                        rss_aggregates={'min': 0.0, 'max': 0.0, 'avg': 0.0, 'std': 0.0},
+                    )
+                    pipeline.metrics.record_step(m_total)
+            except Exception as e:
+                logging.warning(f"metrics record failed after processing (total latency): {e}")
             
             request_queue.task_done()
         except Exception as e:
@@ -367,7 +595,8 @@ def handle_query():
         # Add to queue
         request_queue.put({
             'request_id': request_id,
-            'query': query
+            'query': query,
+            'enqueue_ts': time.time()
         })
 
         # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
@@ -427,6 +656,11 @@ def main():
     hostname = NODE_0_IP.split(':')[0]
     port = int(NODE_0_IP.split(':')[1]) if ':' in NODE_0_IP else 8000
     app.run(host=hostname, port=port, threaded=True)
+    # On server stop, flush metrics
+    try:
+        pipeline.metrics.flush()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
