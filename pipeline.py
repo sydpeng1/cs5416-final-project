@@ -20,6 +20,7 @@ from sentence_transformers import SentenceTransformer
 from flask import Flask, request, jsonify
 from queue import Queue
 import threading
+import requests
 
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
@@ -40,6 +41,13 @@ CONFIG = {
     'truncate_length': 512 # You must use this truncate length
 }
 
+# Map node numbers to their specific IP variables
+node_ip_map = {
+    0: NODE_0_IP,
+    1: NODE_1_IP,
+    2: NODE_2_IP
+}
+
 # Flask app
 app = Flask(__name__)
 
@@ -47,6 +55,10 @@ app = Flask(__name__)
 request_queue = Queue()
 results = {}
 results_lock = threading.Lock()
+
+# Node 0's round-robin counter
+request_counter = 0
+request_counter_lock = threading.Lock()
 
 @dataclass
 class PipelineRequest:
@@ -349,6 +361,8 @@ def process_requests_worker():
 
 @app.route('/query', methods=['POST'])
 def handle_query():
+    global request_counter
+
     """Handle incoming query requests"""
     try:
         data = request.json
@@ -357,14 +371,34 @@ def handle_query():
         
         if not request_id or not query:
             return jsonify({'error': 'Missing request_id or query'}), 400
-        
+
+        # node 0 should assign requests in round-robin manner
+        if NODE_NUMBER == 0:
+            with request_counter_lock:
+                target_node = request_counter % TOTAL_NODES
+                request_counter += 1
+
+            if target_node != 0:
+                target_ip = NODE_1_IP if target_node == 1 else NODE_2_IP
+                target_url = f"http://{target_ip}/query"
+
+                print(f"Node 0 forwarding request {request_id} to Node {target_node} ({target_url})")
+
+                try:
+                    response = requests.post(target_url, json=data, timeout=300)
+                    return jsonify(response.json()), response.status_code
+                except Exception as e:
+                    print(f"Failed to forward to Node {target_node}: {e}... Falling back to Node 0")
+                    pass
+
         # Check if result already exists (request already processed)
         with results_lock:
             if request_id in results:
                 return jsonify(results[request_id]), 200
-        
-        print(f"queueing request {request_id}")
-        # Add to queue
+
+        print(f"Node {NODE_NUMBER} queueing request {request_id}")
+
+        # Add to queue (Existing logic)
         request_queue.put({
             'request_id': request_id,
             'query': query
@@ -421,11 +455,17 @@ def main():
     worker_thread = threading.Thread(target=process_requests_worker, daemon=True)
     worker_thread.start()
     print("Worker thread started!")
-    
+
+    # Get the IP for THIS specific node (default to Node 0 if undefined)
+    current_node_ip = node_ip_map.get(NODE_NUMBER, NODE_0_IP)
+
+    print(f"Binding to {current_node_ip} for Node {NODE_NUMBER}")
+
+    hostname = current_node_ip.split(':')[0]
+    port = int(current_node_ip.split(':')[1]) if ':' in current_node_ip else 8000
+
     # Start Flask server
     print(f"\nStarting Flask server")
-    hostname = NODE_0_IP.split(':')[0]
-    port = int(NODE_0_IP.split(':')[1]) if ':' in NODE_0_IP else 8000
     app.run(host=hostname, port=port, threaded=True)
 
 
