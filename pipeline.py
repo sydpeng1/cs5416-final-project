@@ -21,6 +21,7 @@ from flask import Flask, request, jsonify
 from queue import Queue
 import threading
 import requests
+import psutil
 
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
@@ -120,38 +121,55 @@ class MonolithicPipeline:
             print(f"- {request.request_id}: {request.query[:50]}...")
         
         # Step 1: Generate embeddings
-        print("\n[Step 1/7] Generating embeddings for batch...")
-        query_embeddings = self._generate_embeddings_batch(queries)
+        query_embeddings = self._profile_step(
+            "1. Embeddings",
+            self._generate_embeddings_batch,
+            queries
+        )
 
         # Step 2: FAISS ANN search
-        print("\n[Step 2/7] Performing FAISS ANN search for batch...")
-        doc_id_batches = self._faiss_search_batch(query_embeddings)
+        doc_id_batches = self._profile_step(
+            "2. FAISS Search",
+            self._faiss_search_batch,
+            query_embeddings
+        )
 
         # Step 3: Fetch documents from disk
-        print("\n[Step 3/7] Fetching documents for batch...")
-        documents_batch = self._fetch_documents_batch(doc_id_batches)
+        documents_batch = self._profile_step(
+            "3. Fetch Docs (SQLite)",
+            self._fetch_documents_batch,
+            doc_id_batches
+        )
 
         # Step 4: Rerank documents
-        print("\n[Step 4/7] Reranking documents for batch...")
-        reranked_docs_batch = self._rerank_documents_batch(
+        reranked_docs_batch = self._profile_step(
+            "4. Reranker",
+            self._rerank_documents_batch,
             queries,
             documents_batch
         )
 
         # Step 5: Generate LLM responses
-        print("\n[Step 5/7] Generating LLM responses for batch...")
-        responses_text = self._generate_responses_batch(
+        responses_text = self._profile_step(
+            "5. LLM Generation",
+            self._generate_responses_batch,
             queries,
             reranked_docs_batch
         )
 
         # Step 6: Sentiment analysis
-        print("\n[Step 6/7] Analyzing sentiment for batch...")
-        sentiments = self._analyze_sentiment_batch(responses_text)
+        sentiments = self._profile_step(
+            "6. Sentiment Analysis",
+            self._analyze_sentiment_batch,
+            responses_text
+        )
 
         # Step 7: Safety filter on responses
-        print("\n[Step 7/7] Applying safety filter to batch...")
-        toxicity_flags = self._filter_response_safety_batch(responses_text)
+        toxicity_flags = self._profile_step(
+            "7. Safety Filter",
+            self._filter_response_safety_batch,
+            responses_text
+        )
         
         responses = []
         for idx, request in enumerate(requests):
@@ -320,6 +338,45 @@ class MonolithicPipeline:
         del classifier
         gc.collect()
         return toxicity_flags
+
+    def _profile_step(self, step_name, func, *args, **kwargs):
+        """
+        Profiles execution Wall Time, CPU Time, and Memory (RSS) delta.
+        """
+        print(f"\n--- [START] {step_name} ---")
+
+        # 1. Force GC for cleaner memory baseline
+        gc.collect()
+
+        # 2. Snapshot Before
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / (1024 * 1024)  # MB
+        start_wall = time.time()
+        start_cpu = time.process_time()  # Measures CPU time consumed by process
+
+        # 3. Run the function
+        result = func(*args, **kwargs)
+
+        # 4. Snapshot After
+        end_wall = time.time()
+        end_cpu = time.process_time()
+        mem_after = process.memory_info().rss / (1024 * 1024)  # MB
+
+        # 5. Calculations
+        wall_duration = end_wall - start_wall
+        cpu_duration = end_cpu - start_cpu
+        mem_delta = mem_after - mem_before
+
+        # Calculate CPU Utilization for this step (can be >100% if multi-threaded)
+        cpu_utilization = (cpu_duration / wall_duration) * 100 if wall_duration > 0 else 0
+
+        print(f"--- [END] {step_name} ---")
+        print(f"    Wall Time:    {wall_duration:.4f}s")
+        print(f"    CPU Time:     {cpu_duration:.4f}s (Util: {cpu_utilization:.1f}%)")
+        print(f"    Mem Delta:    {'+' if mem_delta > 0 else ''}{mem_delta:.2f} MB")
+        print(f"    Mem Peak:     {mem_after:.2f} MB")
+
+        return result
 
 
 # Global pipeline instance

@@ -1,0 +1,313 @@
+Starting pipeline on Node 0...
+============================================================
+MONOLITHIC CUSTOMER SUPPORT PIPELINE
+============================================================
+
+Running on Node 0 of 1 nodes
+Node IPs: 0=localhost:8000, 1=localhost:8000, 2=localhost:8000
+
+NOTE: This implementation is deliberately inefficient.
+Your task is to optimize this for a 3-node cluster.
+
+Initializing pipeline...
+Initializing pipeline on cpu
+Node 0/1
+FAISS index path: faiss_index.bin
+Documents path: documents/
+Pipeline initialized!
+Worker thread started!
+Binding to localhost:8000 for Node 0
+
+Starting Flask server
+ * Serving Flask app 'pipeline'
+ * Debug mode: off
+Node 0 queueing request req_1764827777_0
+
+============================================================
+Processing batch of 1 requests
+============================================================
+- req_1764827777_0: How do I return a defective product?...
+
+--- [START] 1. Embeddings ---
+--- [END] 1. Embeddings ---
+    Wall Time:    1.1684s
+    CPU Time:     0.3417s (Util: 29.2%)
+    Mem Delta:    +67.81 MB
+    Mem Peak:     507.50 MB
+
+--- [START] 2. FAISS Search ---
+Loading FAISS index
+Node 0 queueing request req_1764827787_1
+--- [END] 2. FAISS Search ---
+    Wall Time:    9.3642s
+    CPU Time:     7.1218s (Util: 76.1%)
+    Mem Delta:    +3953.25 MB
+    Mem Peak:     4460.75 MB
+
+--- [START] 3. Fetch Docs (SQLite) ---
+--- [END] 3. Fetch Docs (SQLite) ---
+    Wall Time:    0.0038s
+    CPU Time:     0.0010s (Util: 27.6%)
+    Mem Delta:    +0.55 MB
+    Mem Peak:     4461.33 MB
+
+--- [START] 4. Reranker ---
+--- [END] 4. Reranker ---
+    Wall Time:    1.6137s
+    CPU Time:     1.0971s (Util: 68.0%)
+    Mem Delta:    +185.17 MB
+    Mem Peak:     4646.50 MB
+
+--- [START] 5. LLM Generation ---
+--- [END] 5. LLM Generation ---
+    Wall Time:    5.5976s
+    CPU Time:     15.3568s (Util: 274.3%)
+    Mem Delta:    -3147.41 MB
+    Mem Peak:     1499.09 MB
+
+--- [START] 6. Sentiment Analysis ---
+--- [END] 6. Sentiment Analysis ---
+    Wall Time:    1.3918s
+    CPU Time:     0.4353s (Util: 31.3%)
+    Mem Delta:    -3.70 MB
+    Mem Peak:     1495.39 MB
+
+--- [START] 7. Safety Filter ---
+Node 0 queueing request req_1764827797_2
+--- [END] 7. Safety Filter ---
+    Wall Time:    0.8424s
+    CPU Time:     0.3520s (Util: 41.8%)
+    Mem Delta:    -8.39 MB
+    Mem Peak:     1487.00 MB
+
+✓ Request req_1764827777_0 processed in 20.41 seconds
+
+============================================================
+Processing batch of 1 requests
+============================================================
+- req_1764827787_1: What is your refund policy?...
+
+--- [START] 1. Embeddings ---
+--- [END] 1. Embeddings ---
+    Wall Time:    1.0542s
+    CPU Time:     0.3578s (Util: 33.9%)
+    Mem Delta:    +0.88 MB
+    Mem Peak:     1487.88 MB
+
+--- [START] 2. FAISS Search ---
+Loading FAISS index
+Node 0 queueing request req_1764827807_3
+--- [END] 2. FAISS Search ---
+    Wall Time:    8.9851s
+    CPU Time:     7.1665s (Util: 79.8%)
+    Mem Delta:    +2959.50 MB
+    Mem Peak:     4447.38 MB
+
+--- [START] 3. Fetch Docs (SQLite) ---
+--- [END] 3. Fetch Docs (SQLite) ---
+    Wall Time:    0.0043s
+    CPU Time:     0.0014s (Util: 33.8%)
+    Mem Delta:    +0.56 MB
+    Mem Peak:     4448.00 MB
+
+--- [START] 4. Reranker ---
+--- [END] 4. Reranker ---
+    Wall Time:    1.6046s
+    CPU Time:     1.0884s (Util: 67.8%)
+    Mem Delta:    +166.69 MB
+    Mem Peak:     4614.70 MB
+
+--- [START] 5. LLM Generation ---
+--- [END] 5. LLM Generation ---
+    Wall Time:    3.6980s
+    CPU Time:     10.2313s (Util: 276.7%)
+    Mem Delta:    -3133.77 MB
+    Mem Peak:     1480.94 MB
+
+--- [START] 6. Sentiment Analysis ---
+--- [END] 6. Sentiment Analysis ---
+    Wall Time:    0.9152s
+    CPU Time:     0.4263s (Util: 46.6%)
+    Mem Delta:    -6.59 MB
+    Mem Peak:     1474.34 MB
+
+--- [START] 7. Safety Filter ---
+--- [END] 7. Safety Filter ---
+    Wall Time:    0.6278s
+    CPU Time:     0.2662s (Util: 42.4%)
+    Mem Delta:    -7.20 MB
+    Mem Peak:     1467.14 MB
+
+✓ Request req_1764827787_1 processed in 17.26 seconds
+
+============================================================
+Processing batch of 1 requests
+============================================================
+- req_1764827797_2: My order hasn't arrived yet, tracking number is AB...
+
+--- [START] 1. Embeddings ---
+--- [END] 1. Embeddings ---
+    Wall Time:    1.1677s
+    CPU Time:     0.3871s (Util: 33.1%)
+    Mem Delta:    +7.16 MB
+    Mem Peak:     1474.36 MB
+
+--- [START] 2. FAISS Search ---
+Loading FAISS index
+Node 0 queueing request req_1764827817_4
+--- [END] 2. FAISS Search ---
+    Wall Time:    9.0582s
+    CPU Time:     7.1260s (Util: 78.7%)
+    Mem Delta:    +2958.16 MB
+    Mem Peak:     4432.52 MB
+
+--- [START] 3. Fetch Docs (SQLite) ---
+--- [END] 3. Fetch Docs (SQLite) ---
+    Wall Time:    0.0049s
+    CPU Time:     0.0015s (Util: 31.0%)
+    Mem Delta:    +0.38 MB
+    Mem Peak:     4432.97 MB
+
+--- [START] 4. Reranker ---
+--- [END] 4. Reranker ---
+    Wall Time:    1.6501s
+    CPU Time:     1.1695s (Util: 70.9%)
+    Mem Delta:    +178.30 MB
+    Mem Peak:     4611.27 MB
+
+--- [START] 5. LLM Generation ---
+--- [END] 5. LLM Generation ---
+    Wall Time:    2.9976s
+    CPU Time:     8.2938s (Util: 276.7%)
+    Mem Delta:    -3147.83 MB
+    Mem Peak:     1463.44 MB
+
+--- [START] 6. Sentiment Analysis ---
+--- [END] 6. Sentiment Analysis ---
+    Wall Time:    0.7649s
+    CPU Time:     0.3598s (Util: 47.0%)
+    Mem Delta:    -6.14 MB
+    Mem Peak:     1457.30 MB
+
+--- [START] 7. Safety Filter ---
+--- [END] 7. Safety Filter ---
+    Wall Time:    0.4328s
+    CPU Time:     0.2387s (Util: 55.2%)
+    Mem Delta:    -8.05 MB
+    Mem Peak:     1449.25 MB
+
+✓ Request req_1764827797_2 processed in 16.48 seconds
+
+============================================================
+Processing batch of 1 requests
+============================================================
+- req_1764827807_3: How do I update my billing information?...
+
+--- [START] 1. Embeddings ---
+--- [END] 1. Embeddings ---
+    Wall Time:    1.0743s
+    CPU Time:     0.3150s (Util: 29.3%)
+    Mem Delta:    +3.38 MB
+    Mem Peak:     1452.62 MB
+
+--- [START] 2. FAISS Search ---
+Loading FAISS index
+--- [END] 2. FAISS Search ---
+    Wall Time:    9.2037s
+    CPU Time:     7.2952s (Util: 79.3%)
+    Mem Delta:    +3005.56 MB
+    Mem Peak:     4458.19 MB
+
+--- [START] 3. Fetch Docs (SQLite) ---
+--- [END] 3. Fetch Docs (SQLite) ---
+    Wall Time:    0.0039s
+    CPU Time:     0.0010s (Util: 26.2%)
+    Mem Delta:    +0.31 MB
+    Mem Peak:     4458.58 MB
+
+--- [START] 4. Reranker ---
+--- [END] 4. Reranker ---
+    Wall Time:    1.6279s
+    CPU Time:     1.1073s (Util: 68.0%)
+    Mem Delta:    +161.03 MB
+    Mem Peak:     4619.61 MB
+
+--- [START] 5. LLM Generation ---
+--- [END] 5. LLM Generation ---
+    Wall Time:    4.8928s
+    CPU Time:     13.5854s (Util: 277.7%)
+    Mem Delta:    -3161.03 MB
+    Mem Peak:     1458.58 MB
+
+--- [START] 6. Sentiment Analysis ---
+--- [END] 6. Sentiment Analysis ---
+    Wall Time:    0.8702s
+    CPU Time:     0.4091s (Util: 47.0%)
+    Mem Delta:    -6.47 MB
+    Mem Peak:     1452.11 MB
+
+--- [START] 7. Safety Filter ---
+--- [END] 7. Safety Filter ---
+    Wall Time:    0.8141s
+    CPU Time:     0.3446s (Util: 42.3%)
+    Mem Delta:    -7.86 MB
+    Mem Peak:     1444.25 MB
+
+✓ Request req_1764827807_3 processed in 18.96 seconds
+
+============================================================
+Processing batch of 1 requests
+============================================================
+- req_1764827817_4: Is there a warranty on electronic items?...
+
+--- [START] 1. Embeddings ---
+--- [END] 1. Embeddings ---
+    Wall Time:    1.2741s
+    CPU Time:     0.3425s (Util: 26.9%)
+    Mem Delta:    +2.09 MB
+    Mem Peak:     1446.36 MB
+
+--- [START] 2. FAISS Search ---
+Loading FAISS index
+--- [END] 2. FAISS Search ---
+    Wall Time:    8.8903s
+    CPU Time:     6.9595s (Util: 78.3%)
+    Mem Delta:    +3006.75 MB
+    Mem Peak:     4453.11 MB
+
+--- [START] 3. Fetch Docs (SQLite) ---
+--- [END] 3. Fetch Docs (SQLite) ---
+    Wall Time:    0.0049s
+    CPU Time:     0.0016s (Util: 32.4%)
+    Mem Delta:    +0.47 MB
+    Mem Peak:     4453.64 MB
+
+--- [START] 4. Reranker ---
+--- [END] 4. Reranker ---
+    Wall Time:    1.5898s
+    CPU Time:     1.1143s (Util: 70.1%)
+    Mem Delta:    +199.45 MB
+    Mem Peak:     4653.12 MB
+
+--- [START] 5. LLM Generation ---
+--- [END] 5. LLM Generation ---
+    Wall Time:    1.5367s
+    CPU Time:     4.0561s (Util: 263.9%)
+    Mem Delta:    -3169.23 MB
+    Mem Peak:     1483.89 MB
+
+--- [START] 6. Sentiment Analysis ---
+--- [END] 6. Sentiment Analysis ---
+    Wall Time:    0.8654s
+    CPU Time:     0.3072s (Util: 35.5%)
+    Mem Delta:    -4.48 MB
+    Mem Peak:     1479.41 MB
+
+--- [START] 7. Safety Filter ---
+--- [END] 7. Safety Filter ---
+    Wall Time:    0.8211s
+    CPU Time:     0.2459s (Util: 29.9%)
+    Mem Delta:    -4.91 MB
+    Mem Peak:     1474.52 MB
+
+✓ Request req_1764827817_4 processed in 15.39 seconds
