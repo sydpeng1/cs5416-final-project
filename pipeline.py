@@ -94,12 +94,12 @@ class DistributedPipeline:
 
         logger.info("Node 0 Ready.")
 
-    def process_batch(self, requests: List[PipelineRequest]) -> List[PipelineResponse]:
-        if not requests: return []
+    def process_batch(self, batch_requests: List[PipelineRequest]) -> List[PipelineResponse]:
+        if not batch_requests: return []
 
         start_time = time.time()
-        batch_size = len(requests)
-        queries = [req.query for req in requests]
+        batch_size = len(batch_requests)
+        queries = [req.query for req in batch_requests]
         logger.info(f"--- Processing Batch of {batch_size} Requests ---")
 
         try:
@@ -151,7 +151,7 @@ class DistributedPipeline:
             pipeline_responses = []
             total_duration = time.time() - start_time
 
-            for i, req in enumerate(requests):
+            for i, req in enumerate(batch_requests):
                 # Individual request latency (approximate based on batch end)
                 req_latency = time.time() - req.timestamp
 
