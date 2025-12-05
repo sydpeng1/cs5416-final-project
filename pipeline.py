@@ -1,35 +1,40 @@
+#!/usr/bin/env python3
 import os
 import time
 import threading
-import logging
-import requests
-import numpy as np
-import torch
 from queue import Queue, Empty
-from typing import List, Dict, Any
 from dataclasses import dataclass
+from typing import Dict, Any, List
+
+import torch
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline as hf_pipeline
 
-# Configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# -------------------------
+# Config
+# -------------------------
+TOTAL_NODES = int(os.environ.get("TOTAL_NODES", 3))
+NODE_NUMBER = int(os.environ.get("NODE_NUMBER", 0))
+NODE_0_IP = os.environ.get("NODE_0_IP", "127.0.0.1:8000")
+NODE_1_IP = os.environ.get("NODE_1_IP", "127.0.0.1:8001")
+NODE_2_IP = os.environ.get("NODE_2_IP", "127.0.0.1:8002")
 
-TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
-NODE_NUMBER = int(os.environ.get('NODE_NUMBER', 0))
-NODE_0_IP_RAW = os.environ.get('NODE_0_IP', 'localhost:8000')
-NODE_1_IP_RAW = os.environ.get('NODE_1_IP', 'localhost:8001')  # Default to 8001
-NODE_2_IP_RAW = os.environ.get('NODE_2_IP', 'localhost:8002')  # Default to 8002
+BATCH_MAX_SIZE = 8
+BATCH_MAX_WAIT = 0.10  # opportunistic batching, 100ms
+TRUNCATE_LENGTH = 256
 
-BATCH_SIZE = 16
-BATCH_TIMEOUT = 0.5
-TRUNCATE_LENGTH = 512
 
-# Flask App
+# -------------------------
+# Flask + Global State
+# -------------------------
 app = Flask(__name__)
-request_queue = Queue()
-results = {}
+
+request_queue: "Queue[Dict[str, Any]]" = Queue()
+results: Dict[str, Dict[str, Any]] = {}
+waiters: Dict[str, threading.Condition] = {}
+request_start_times: Dict[str, float] = {}
+
 results_lock = threading.Lock()
 
 
@@ -40,264 +45,245 @@ class PipelineRequest:
     timestamp: float
 
 
-@dataclass
-class PipelineResponse:
-    request_id: str
-    generated_response: str
-    sentiment: str
-    is_toxic: str
-    processing_time: float
-
-
-class DistributedPipeline:
-    """
-    Orchestrator Node (Node 0):
-    1. Local: Embed Query
-    2. Remote (Node 1): Search Index -> Get Doc IDs
-    3. Remote (Node 2): Fetch + Rerank + Generate -> Get Text
-    4. Local: Sentiment + Safety Analysis
-    """
+# -------------------------
+# Node0 Pipeline Class
+# -------------------------
+class Node0Pipeline:
     def __init__(self):
-        # HuggingFace pipelines expect an integer: 0 for GPU, -1 for CPU
-        self.device = 0 if torch.cuda.is_available() else -1
+        print("[Node0] Initializing pipeline...")
 
-        # SentenceTransformer expects a string: "cuda" or "cpu"
-        self.device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[Node0] Using device: {self.device}")
 
-        logger.info(f"Initializing Distributed Pipeline on Node {NODE_NUMBER}")
-        logger.info(f"Compute Device: {self.device_str} (ID: {self.device})")
+        print("[Node0] Loading embedder...")
+        self.embedder = SentenceTransformer("BAAI/bge-base-en-v1.5", device=self.device)
 
-        # Service URLs
-        n1_host = NODE_1_IP_RAW.split(':')[0]
-        n1_port = int(NODE_1_IP_RAW.split(':')[1]) if ':' in NODE_1_IP_RAW else 8001
-        self.retrieval_url = f"http://{n1_host}:{n1_port}/search"
+        print("[Node0] Loading analysis models...")
+        d = 0 if torch.cuda.is_available() else -1
 
-        n2_host = NODE_2_IP_RAW.split(':')[0]
-        n2_port = int(NODE_2_IP_RAW.split(':')[1]) if ':' in NODE_2_IP_RAW else 8002
-        self.inference_url = f"http://{n2_host}:{n2_port}/generate"
+        self.sentiment_pipe = hf_pipeline(
+            "sentiment-analysis",
+            model="nlptown/bert-base-multilingual-uncased-sentiment",
+            device=d,
+        )
 
-        logger.info(f"Target Node 1 (Retrieval): {self.retrieval_url}")
-        logger.info(f"Target Node 2 (Inference): {self.inference_url}")
+        self.safety_pipe = hf_pipeline(
+            "text-classification",
+            model="unitary/toxic-bert",
+            device=d,
+        )
 
-        # Load Lightweight Models
-        logger.info("Loading Embedder (Local)...")
-        self.embedder = SentenceTransformer('BAAI/bge-base-en-v1.5', device=self.device_str)
+        self.node1_url = f"http://{NODE_1_IP}/search_and_rerank_batch"
+        print(f"[Node0] Node1 URL = {self.node1_url}")
 
-        logger.info("Loading Analysis Models (Local)...")
-        self.sentiment_pipe = hf_pipeline("sentiment-analysis",
-                                          model='nlptown/bert-base-multilingual-uncased-sentiment',
-                                          device=self.device)
+    # -------------------------
+    # Process a batch
+    # -------------------------
+    def run_batch(self, reqs: List[PipelineRequest]):
+        if not reqs:
+            return
 
-        self.safety_pipe = hf_pipeline("text-classification",
-                                       model='unitary/toxic-bert',
-                                       device=self.device)
+        queries = [r.query for r in reqs]
+        request_ids = [r.request_id for r in reqs]
 
-        logger.info("Node 0 Ready.")
+        print(f"\n[Node0] Processing batch size={len(reqs)}")
 
-    def process_batch(self, batch_requests: List[PipelineRequest]) -> List[PipelineResponse]:
-        if not batch_requests: return []
+        # 1. Embedding
+        t0 = time.time()
+        emb = self.embedder.encode(
+            queries, normalize_embeddings=True, convert_to_numpy=True
+        )
+        print(f"[Node0] Embedding time: {time.time() - t0:.3f}s")
 
-        start_time = time.time()
-        batch_size = len(batch_requests)
-        queries = [req.query for req in batch_requests]
-        logger.info(f"--- Processing Batch of {batch_size} Requests ---")
+        # 2. Send batch to Node1
+        import requests
+
+        embeddings = emb.tolist()
+
+        print(
+            f"[Node0] Sending batch -> Node1 count={len(reqs)} ids={request_ids} emb_dim={len(embeddings[0]) if embeddings else 0}"
+        )
+
+        payload = {
+            "requests": [
+                {
+                    "request_id": req.request_id,
+                    "query": req.query,
+                    "embedding": embeddings[i],
+                    "timestamp": req.timestamp,
+                }
+                for i, req in enumerate(reqs)
+            ]
+        }
 
         try:
-            # --- STEP 1: Embedding (Local) ---
-            t0 = time.time()
-            embeddings = self.embedder.encode(queries, normalize_embeddings=True, convert_to_numpy=True)
-            logger.info(f"[1] Embeddings: {time.time() - t0:.3f}s")
-
-            # --- STEP 2: Retrieval (Node 1) ---
-            t0 = time.time()
-            # Convert numpy to list for JSON serialization
-            payload_n1 = {'embeddings': embeddings.tolist()}
-            resp_n1 = requests.post(self.retrieval_url, json=payload_n1, timeout=30)
-            resp_n1.raise_for_status()
-            doc_ids_batch = resp_n1.json()['doc_ids']
-            logger.info(f"[2] Retrieval (Node 1): {time.time() - t0:.3f}s")
-
-            # --- STEP 3: Generation (Node 2) ---
-            t0 = time.time()
-            payload_n2 = {
-                'queries': queries,
-                'doc_ids': doc_ids_batch
-            }
-            resp_n2 = requests.post(self.inference_url, json=payload_n2, timeout=300)
-            resp_n2.raise_for_status()
-            responses_text = resp_n2.json()['responses']
-            logger.info(f"[3] Generation (Node 2): {time.time() - t0:.3f}s")
-
-            # --- STEP 4: Analysis (Local) ---
-            t0 = time.time()
-            # Truncate for BERT models to prevent errors
-            truncated_texts = [t[:TRUNCATE_LENGTH] for t in responses_text]
-
-            # Run Sentiment & Safety in parallel conceptually (sequential here for simplicity)
-            raw_sentiments = self.sentiment_pipe(truncated_texts)
-            raw_safety = self.safety_pipe(truncated_texts)
-
-            # Parse Results
-            sentiment_map = {
-                '1 star': 'very negative', '2 stars': 'negative',
-                '3 stars': 'neutral', '4 stars': 'positive', '5 stars': 'very positive'
-            }
-            final_sentiments = [sentiment_map.get(r['label'], 'neutral') for r in raw_sentiments]
-            is_toxic_flags = [r['score'] > 0.5 for r in raw_safety]
-
-            logger.info(f"[4] Analysis: {time.time() - t0:.3f}s")
-
-            # --- Assemble Responses ---
-            pipeline_responses = []
-            total_duration = time.time() - start_time
-
-            for i, req in enumerate(batch_requests):
-                # Individual request latency (approximate based on batch end)
-                req_latency = time.time() - req.timestamp
-
-                pipeline_responses.append(PipelineResponse(
-                    request_id=req.request_id,
-                    generated_response=responses_text[i],
-                    sentiment=final_sentiments[i],
-                    is_toxic="true" if is_toxic_flags[i] else "false",
-                    processing_time=req_latency
-                ))
-
-            logger.info(f"Batch completed in {total_duration:.3f}s")
-            return pipeline_responses
-
+            requests.post(self.node1_url, json=payload, timeout=300)
         except Exception as e:
-            logger.error(f"Batch Failed: {e}")
-            return []
+            print(f"[Node0] ERROR sending to Node1: {e}")
 
 
-pipeline_instance = None
+pipeline = Node0Pipeline()
 
 
-def worker_loop():
-    global pipeline_instance
-    logger.info("Worker thread started. Waiting for requests...")
+# -------------------------
+# Worker Thread (Batching)
+# -------------------------
+def batch_worker():
+    print("[Node0] Batch worker started")
 
     while True:
-        batch = []
         try:
-            # 1. Blocking Get (Wait for first item)
-            first_req = request_queue.get()
-            if first_req is None: break  # Shutdown signal
-            batch.append(first_req)
+            first = request_queue.get()
+            if first is None:
+                break
 
-            # 2. Opportunistic Collection
-            # Try to grab more items if they are immediately available (up to BATCH_SIZE)
-            start_wait = time.time()
-            while len(batch) < BATCH_SIZE:
-                # Calculate remaining time in timeout window
-                remaining = BATCH_TIMEOUT - (time.time() - start_wait)
-                if remaining <= 0: break
+            batch = [first]
+            start_t = first["timestamp"]
 
+            while len(batch) < BATCH_MAX_SIZE:
                 try:
-                    # Non-blocking get (or very short timeout)
-                    req = request_queue.get(timeout=remaining)
-                    batch.append(req)
+                    remain = BATCH_MAX_WAIT - (time.time() - start_t)
+                    if remain <= 0:
+                        break
+                    nxt = request_queue.get(timeout=remain)
+                    if nxt is None:
+                        break
+                    batch.append(nxt)
                 except Empty:
                     break
 
-            # 3. Convert dicts to Request Objects
-            req_objects = [PipelineRequest(r['request_id'], r['query'], r['timestamp']) for r in batch]
+            reqs = [
+                PipelineRequest(i["request_id"], i["query"], i["timestamp"])
+                for i in batch
+            ]
 
-            # 4. Process Batch
-            responses = pipeline_instance.process_batch(req_objects)
+            pipeline.run_batch(reqs)
 
-            # 5. Store Results & Mark Task Done
-            with results_lock:
-                for res in responses:
-                    results[res.request_id] = {
-                        'request_id': res.request_id,
-                        'generated_response': res.generated_response,
-                        'sentiment': res.sentiment,
-                        'is_toxic': res.is_toxic,
-                        'success': True
-                    }
-
-            # If batch failed (empty response), mark errors
-            if not responses:
-                with results_lock:
-                    for r in batch:
-                        if r['request_id'] not in results:
-                            results[r['request_id']] = {'error': 'Pipeline Error', 'success': False}
-
-            # Notify queue we are done
             for _ in batch:
                 request_queue.task_done()
 
         except Exception as e:
-            logger.error(f"Worker Loop Error: {e}")
+            print(f"[Node0] Worker error: {e}")
 
 
-# Routes
-@app.route('/query', methods=['POST'])
-def handle_query():
-    try:
-        data = request.json
-        req_id = data.get('request_id')
-        query = data.get('query')
+# -------------------------
+# Node2 Callback Handler
+# -------------------------
+@app.route("/node2_callback", methods=["POST"])
+def node2_callback():
+    data = request.json or {}
+    req_id = data.get("request_id")
+    generated = data.get("generated_text", "")
+    llm_duration = data.get("llm_duration")
 
-        if not req_id or not query:
-            return jsonify({'error': 'Missing params'}), 400
+    if not req_id:
+        return jsonify({"error": "missing request_id"}), 400
 
-        # Check cache/duplicate
-        with results_lock:
-            if req_id in results:
-                return jsonify(results[req_id]), 200
+    # --- local sentiment & safety ---
+    truncated = generated[:TRUNCATE_LENGTH]
 
-        # Enqueue
-        request_queue.put({
-            'request_id': req_id,
-            'query': query,
-            'timestamp': time.time()
-        })
+    sent_raw = pipeline.sentiment_pipe([truncated])[0]
+    tox_raw = pipeline.safety_pipe([truncated])[0]
 
-        # Wait for result (Polling)
-        timeout = 300
-        start_wait = time.time()
-        while time.time() - start_wait < timeout:
-            with results_lock:
-                if req_id in results:
-                    return jsonify(results.pop(req_id)), 200
-            time.sleep(0.05)  # Check every 50ms
+    sentiment_map = {
+        "1 star": "very negative",
+        "2 stars": "negative",
+        "3 stars": "neutral",
+        "4 stars": "positive",
+        "5 stars": "very positive",
+    }
+    sentiment = sentiment_map.get(sent_raw["label"], "neutral")
+    is_toxic = tox_raw["score"] > 0.5
 
-        return jsonify({'error': 'Timeout'}), 504
+    with results_lock:
+        results[req_id] = {
+            "request_id": req_id,
+            "text": generated,
+            "sentiment": sentiment,
+            "is_toxic": is_toxic,
+            "success": True,
+            "llm_duration": llm_duration,
+        }
 
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        cond = waiters.pop(req_id, None)
+
+    if cond:
+        with cond:
+            cond.notify()
+
+    if llm_duration is not None:
+        print(f"[Node0] Callback result stored for {req_id} llm_time={llm_duration:.3f}s")
+    else:
+        print(f"[Node0] Callback result stored for {req_id}")
+    return jsonify({"status": "ok"})
 
 
-@app.route('/health', methods=['GET'])
+# -------------------------
+# API: Client sends queries
+# -------------------------
+@app.route("/query", methods=["POST"])
+def query():
+    data = request.json or {}
+    req_id = data.get("request_id")
+    text = data.get("query")
+
+    if not req_id or not text:
+        return jsonify({"error": "missing request_id or query"}), 400
+
+    cond = threading.Condition()
+
+    start_time = time.time()
+    with results_lock:
+        waiters[req_id] = cond
+        request_start_times[req_id] = start_time
+
+    request_queue.put({"request_id": req_id, "query": text, "timestamp": start_time})
+
+    result = None
+
+    # ----- wait for Node2 result -----
+    with cond:
+        cond.wait(timeout=300)
+
+    with results_lock:
+        if req_id in results:
+            result = results.pop(req_id)
+
+    total_time = None
+    with results_lock:
+        start = request_start_times.pop(req_id, None)
+
+    if result:
+        if start is not None:
+            total_time = time.time() - start
+            llm_time = result.get("llm_duration")
+            if llm_time is not None:
+                print(
+                    f"[Node0] Request {req_id} completed total_time={total_time:.3f}s llm_time={llm_time:.3f}s"
+                )
+            else:
+                print(f"[Node0] Request {req_id} completed total_time={total_time:.3f}s")
+        return jsonify(result), 200
+
+    return jsonify({"error": "timeout"}), 504
+
+
+@app.route("/health")
 def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'node': NODE_NUMBER,
-        'total_nodes': TOTAL_NODES
-    }), 200
+    return jsonify({"status": "healthy", "node": NODE_NUMBER}), 200
 
 
+# -------------------------
+# Main
+# -------------------------
 def main():
-    global pipeline_instance
+    worker = threading.Thread(target=batch_worker, daemon=True)
+    worker.start()
 
-    # Initialize Pipeline (Loads local models)
-    pipeline_instance = DistributedPipeline()
-
-    # Start Worker Thread
-    t = threading.Thread(target=worker_loop, daemon=True)
-    t.start()
-
-    # Start Server
-    hostname = NODE_0_IP_RAW.split(':')[0]
-    port = int(NODE_0_IP_RAW.split(':')[1]) if ':' in NODE_0_IP_RAW else 8000
-
-    logger.info(f"Node 0 Orchestrator listening on {hostname}:{port}")
-    app.run(host=hostname, port=port, threaded=True)
+    host, port = NODE_0_IP.split(":")
+    print(f"[Node0] Listening on {host}:{port}")
+    app.run(host=host, port=int(port), threaded=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
