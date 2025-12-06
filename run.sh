@@ -23,21 +23,21 @@
 # --- CASE 2: REMOTE LINUX (CPU ONLY) CONFIG ---
 # Resource Strategy: High concurrency, Serial processing (CPU hates batches)
 
-## 1. Pipeline Depth
-## Keep pipeline full (2 Active Compute + 2 Network Wait)
-#export MAX_WORKERS=4
-#
-## 2. CPU Threading (The Critical Fix)
-## Limit PyTorch to 3 cores per task.
-## Since Node 0 runs ~2 tasks locally at once, 2 * 3 = 6 Cores. Perfect fit.
-#export OMP_NUM_THREADS=3
-#
-## 3. Batching
-#export BATCH_SIZE=16
-#export BATCH_TIMEOUT=0.1
-## CPU vectorization is poor. Serial processing (1 at a time) is often faster/safer.
-## If you had a T4 GPU, you would set this to 4 or 8.
-#export GPU_MICRO_BATCH_SIZE=1
+# 1. Pipeline Depth
+# Keep pipeline full (2 Active Compute + 2 Network Wait)
+export MAX_WORKERS=4
+
+# 2. CPU Threading (The Critical Fix)
+# Limit PyTorch to 3 cores per task.
+# Since Node 0 runs ~2 tasks locally at once, 2 * 3 = 6 Cores. Perfect fit.
+export OMP_NUM_THREADS=3
+
+# 3. Batching
+export BATCH_SIZE=8
+export BATCH_TIMEOUT=0.1
+# CPU vectorization is poor. Serial processing (1 at a time) is often faster/safer.
+# If you had a T4 GPU, you would set this to 4 or 8.
+export GPU_MICRO_BATCH_SIZE=1
 
 
 # --- CASE 3: REMOTE LINUX (TESLA T4 GPU) CONFIG ---
