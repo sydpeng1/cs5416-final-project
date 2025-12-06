@@ -77,7 +77,7 @@ def health():
 
 def worker_loop():
     """Background worker that processes batched search requests and callback Node0"""
-    logger.info("Node 1 Worker thread started. Waiting for search requests...")
+    logger.info("NODE 2 Worker thread started. Waiting for search requests...")
 
     node0_base_url = f"http://{NODE_0_IP_RAW}{NODE0_CALLBACK_PATH}"
     logger.info(f"Node1 will callback Node0 at: {node0_base_url}")
@@ -291,12 +291,12 @@ def main():
 
     worker_thread = threading.Thread(target=worker_loop, daemon=True)
     worker_thread.start()
-    logger.info("Node 1 worker thread started")
+    logger.info("NODE 2 worker thread started")
 
     hostname = NODE_2_IP_RAW.split(":")[0]
     port = int(NODE_2_IP_RAW.split(":")[1]) if ":" in NODE_2_IP_RAW else 8001
 
-    logger.info(f"Node 1 Retrieval Service starting on {hostname}:{port}")
+    logger.info(f"NODE 2 Retrieval Service starting on {hostname}:{port}")
 
     import logging as flask_logging
 
