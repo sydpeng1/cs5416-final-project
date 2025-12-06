@@ -114,6 +114,7 @@ def worker_loop():
                     break
 
             batch_size = len(batch)
+            batch_start = time.time()
             logger.info(f"Processing batch of {batch_size} search requests")
 
             if index is None:
@@ -215,6 +216,11 @@ def worker_loop():
                     "Callbacks to Node0 finished for batch_size=%d time=%.3fs",
                     batch_size,
                     time.time() - callback_start,
+                )
+                logger.info(
+                    "Batch end batch_size=%d total_time=%.3fs",
+                    batch_size,
+                    time.time() - batch_start,
                 )
 
             for _ in batch:
