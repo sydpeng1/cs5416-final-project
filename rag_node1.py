@@ -32,7 +32,7 @@ NODE0_CALLBACK_PATH = "/retrieval_callback"  # ✨ 新增：回调路径
 RETRIEVAL_K = 10
 
 # Async batch processing configuration
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 BATCH_TIMEOUT = 0.05  # 50ms - very fast for retrieval
 MAX_QUEUE_SIZE = 500
 

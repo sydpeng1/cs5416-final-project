@@ -10,11 +10,11 @@ if [ "$NODE_NUMBER" -eq 0 ]; then
 
 elif [ "$NODE_NUMBER" -eq 1 ]; then
     echo "Starting Node $NODE_NUMBER..."
-    exec python rag_node.py
+    exec python rag_node1.py
 
 elif [ "$NODE_NUMBER" -eq 2 ]; then
     echo "Starting Node $NODE_NUMBER..."
-    exec python rag_node.py
+    exec python rag_node2.py
 
 else
     echo "Error: Invalid NODE_NUMBER ($NODE_NUMBER). Must be 0, 1, or 2."

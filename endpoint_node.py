@@ -284,8 +284,22 @@ def embed_worker():
                 }
 
                 try:
-                    requests.post(url, json=payload, timeout=3)
+                    resp = requests.post(url, json=payload, timeout=3)
+                    if resp.status_code != 202:
+                        logger.error(
+                            "[Node0] FAISS POST failed req_id=%s url=%s status=%s body=%s",
+                            r["request_id"],
+                            url,
+                            resp.status_code,
+                            resp.text,
+                        )
                 except Exception as e:
+                    logger.error(
+                        "[Node0] Error sending req_id=%s to %s: %s",
+                        r["request_id"],
+                        url,
+                        e,
+                    )
                     with results_lock:
                         results[r["request_id"]] = {"success": False, "error": str(e)}
 
