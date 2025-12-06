@@ -28,9 +28,16 @@ RERANKER_MODEL_NAME = 'BAAI/bge-reranker-base'
 LLM_MODEL_NAME = 'Qwen/Qwen2.5-0.5B-Instruct'
 MAX_TOKENS = 128
 TRUNCATE_LENGTH = 512
+# Even if we receive 32 requests, process them 4 at a time on GPU
+GPU_MICRO_BATCH_SIZE = 8
 
-# Device Setup (Use GPU if available, else CPU)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Device Setup
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
 
 # Global Model State
 reranker_tokenizer = None
@@ -56,7 +63,10 @@ def load_models():
     llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
 
     # Use float16 if on GPU for memory savings, otherwise float32 for CPU compatibility
-    model_dtype = torch.float16 if device.type == 'cuda' else torch.float32
+    if device.type == 'cuda' or device.type == 'mps':
+        model_dtype = torch.float16
+    else:
+        model_dtype = torch.float32
 
     llm_model = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL_NAME,
@@ -134,44 +144,55 @@ def rerank_documents(queries: List[str], documents_batch: List[List[Dict]]) -> L
     return reranked_batches
 
 
-def generate_responses(queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
+def generate_responses_microbatched(queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
     """Generate final answers using the LLM."""
-    responses = []
+    total_responses = []
+    total_items = len(queries)
 
-    for query, documents in zip(queries, documents_batch):
-        # Format Context (Use top 3 reranked docs)
-        context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
+    for i in range(0, total_items, GPU_MICRO_BATCH_SIZE):
+        # Slice the input
+        chunk_queries = queries[i: i + GPU_MICRO_BATCH_SIZE]
+        chunk_docs = documents_batch[i: i + GPU_MICRO_BATCH_SIZE]
 
-        messages = [
-            {"role": "system", "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
-        ]
+        logger.info(f"   Processing Micro-Batch {i // GPU_MICRO_BATCH_SIZE + 1} ({len(chunk_queries)} items)")
 
-        text = llm_tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+        chunk_responses = []
+        for query, documents in zip(chunk_queries, chunk_docs):
+            # Format Context (Use top 3 reranked docs)
+            context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
 
-        model_inputs = llm_tokenizer([text], return_tensors="pt").to(device)
+            messages = [
+                {"role": "system", "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
+            ]
 
-        with torch.no_grad():
-            generated_ids = llm_model.generate(
-                **model_inputs,
-                max_new_tokens=MAX_TOKENS,
-                temperature=0.01,
-                pad_token_id=llm_tokenizer.eos_token_id
+            text = llm_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
             )
 
-        # Decode only the new tokens
-        generated_ids = [
-            output_ids[len(input_ids):]
-            for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
-        response = llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        responses.append(response)
+            model_inputs = llm_tokenizer([text], return_tensors="pt").to(device)
 
-    return responses
+            with torch.no_grad():
+                generated_ids = llm_model.generate(
+                    **model_inputs,
+                    max_new_tokens=MAX_TOKENS,
+                    temperature=0.01,
+                    pad_token_id=llm_tokenizer.eos_token_id
+                )
+
+            # Decode only the new tokens
+            generated_ids = [
+                output_ids[len(input_ids):]
+                for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            response = llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            chunk_responses.append(response)
+
+        total_responses.extend(chunk_responses)
+
+    return total_responses
 
 
 # Routes
@@ -204,7 +225,7 @@ def generate():
         reranked_docs = rerank_documents(queries, documents_batch)
 
         # 3. Generate (Compute Bound)
-        responses = generate_responses(queries, reranked_docs)
+        responses = generate_responses_microbatched(queries, reranked_docs)
 
         return jsonify({'responses': responses}), 200
 

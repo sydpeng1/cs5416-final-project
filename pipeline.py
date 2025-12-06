@@ -2,6 +2,8 @@ import os
 import time
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 import numpy as np
 import torch
@@ -23,8 +25,9 @@ NODE_1_IP_RAW = os.environ.get('NODE_1_IP', 'localhost:8001')  # Default to 8001
 NODE_2_IP_RAW = os.environ.get('NODE_2_IP', 'localhost:8002')  # Default to 8002
 
 BATCH_SIZE = 16
-BATCH_TIMEOUT = 0.5
+BATCH_TIMEOUT = 0.1
 TRUNCATE_LENGTH = 512
+MAX_WORKERS = 2
 
 # Flask App
 app = Flask(__name__)
@@ -58,11 +61,15 @@ class DistributedPipeline:
     4. Local: Sentiment + Safety Analysis
     """
     def __init__(self):
-        # HuggingFace pipelines expect an integer: 0 for GPU, -1 for CPU
-        self.device = 0 if torch.cuda.is_available() else -1
-
-        # SentenceTransformer expects a string: "cuda" or "cpu"
-        self.device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+            self.device_str = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+            self.device_str = "mps"
+        else:
+            self.device = torch.device('cpu')
+            self.device_str = "cpu"
 
         logger.info(f"Initializing Distributed Pipeline on Node {NODE_NUMBER}")
         logger.info(f"Compute Device: {self.device_str} (ID: {self.device})")
@@ -178,6 +185,9 @@ def worker_loop():
     global pipeline_instance
     logger.info("Worker thread started. Waiting for requests...")
 
+    # Maximum 4 batches "in-flight
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
     while True:
         batch = []
         try:
@@ -204,34 +214,47 @@ def worker_loop():
             # 3. Convert dicts to Request Objects
             req_objects = [PipelineRequest(r['request_id'], r['query'], r['timestamp']) for r in batch]
 
-            # 4. Process Batch
-            responses = pipeline_instance.process_batch(req_objects)
-
-            # 5. Store Results & Mark Task Done
-            with results_lock:
-                for res in responses:
-                    results[res.request_id] = {
-                        'request_id': res.request_id,
-                        'generated_response': res.generated_response,
-                        'sentiment': res.sentiment,
-                        'is_toxic': res.is_toxic,
-                        'success': True
-                    }
-
-            # If batch failed (empty response), mark errors
-            if not responses:
-                with results_lock:
-                    for r in batch:
-                        if r['request_id'] not in results:
-                            results[r['request_id']] = {'error': 'Pipeline Error', 'success': False}
-
-            # Notify queue we are done
-            for _ in batch:
-                request_queue.task_done()
+            # 4. SUBMIT TO THREAD POOL (Non-blocking!)
+            # The main loop immediately goes back to top to fetch next batch
+            executor.submit(run_batch_task, pipeline_instance, req_objects)
 
         except Exception as e:
             logger.error(f"Worker Loop Error: {e}")
 
+
+def run_batch_task(pipeline: DistributedPipeline, batch_reqs: List[PipelineRequest]):
+    """Helper to run processing in a separate thread and save results."""
+    try:
+        # This blocks THIS thread, but not the main worker loop
+        responses = pipeline.process_batch(batch_reqs)
+
+        # Store results
+        with results_lock:
+            for res in responses:
+                results[res.request_id] = {
+                    'request_id': res.request_id,
+                    'generated_response': res.generated_response,
+                    'sentiment': res.sentiment,
+                    'is_toxic': res.is_toxic,
+                    'success': True
+                }
+
+        # Handle total failures (empty response list)
+        if not responses:
+            with results_lock:
+                for r in batch_reqs:
+                    if r.request_id not in results:
+                        results[r.request_id] = {'error': 'Pipeline Error', 'success': False}
+
+    except Exception as e:
+        logger.error(f"Thread Error: {e}")
+        with results_lock:
+            for r in batch_reqs:
+                if r.request_id not in results:
+                    results[r.request_id] = {'error': str(e), 'success': False}
+    finally:
+        for _ in batch_reqs:
+            request_queue.task_done()
 
 # Routes
 @app.route('/query', methods=['POST'])
