@@ -32,6 +32,12 @@ results = {}
 results_lock = threading.Lock()
 requests_sent = []
 requests_lock = threading.Lock()
+print_lock = threading.Lock()
+
+
+def safe_print(msg):
+    with print_lock:
+        print(msg)
 
 
 def send_request_async(request_id: str, query: str, send_time: float):
@@ -48,14 +54,6 @@ def send_request_async(request_id: str, query: str, send_time: float):
 
         if response.status_code == 200:
             result = response.json()
-            print(
-                f"\n[{datetime.now().strftime('%H:%M:%S')}] Response received for {request_id} in {elapsed_time:.2f}s"
-            )
-            print(
-                f"  Generated Response: {result.get('generated_response', '')[:100]}..."
-            )
-            print(f"  Sentiment: {result.get('sentiment')}")
-            print(f"  Is Toxic: {result.get('is_toxic')}")
 
             with results_lock:
                 results[request_id] = {
@@ -64,12 +62,15 @@ def send_request_async(request_id: str, query: str, send_time: float):
                     "send_time": send_time,
                     "success": True,
                 }
-        else:
-            print(
-                f"\n[{datetime.now().strftime('%H:%M:%S')}] Error for {request_id}: HTTP {response.status_code}"
-            )
-            print(f"  Response: {response.text}")
 
+            msg = (
+                f"\n[{datetime.now().strftime('%H:%M:%S')}] Response received for {request_id} in {elapsed_time:.2f}s\n"
+                f"  Generated Response: {result.get('generated_response', '')[:100]}...\n"
+                f"  Sentiment: {result.get('sentiment')}\n"
+                f"  Is Toxic: {result.get('is_toxic')}"
+            )
+            safe_print(msg)
+        else:
             with results_lock:
                 results[request_id] = {
                     "error": f"HTTP {response.status_code}",
@@ -77,6 +78,12 @@ def send_request_async(request_id: str, query: str, send_time: float):
                     "send_time": send_time,
                     "success": False,
                 }
+
+            msg = (
+                f"\n[{datetime.now().strftime('%H:%M:%S')}] Error for {request_id}: HTTP {response.status_code}\n"
+                f"  Response: {response.text}"
+            )
+            safe_print(msg)
 
     except requests.exceptions.Timeout:
         print(
@@ -115,11 +122,12 @@ def main():
     Main function: sends requests every 10 seconds for 1 minute
     Requests are sent at fixed intervals regardless of response time
     """
+    total_requests = 100
     print("=" * 70)
     print("ML INFERENCE PIPELINE CLIENT")
     print("=" * 70)
     print(f"Server URL: {SERVER_URL}")
-    print("Sending 6 requests")
+    print(f"Sending {total_requests} requests")
     print("=" * 70)
 
     # Check if server is healthy
@@ -135,10 +143,10 @@ def main():
     start_time = time.time()
     threads = []
 
-    # Send 6 requests at 10-second intervals
-    for i in range(6):
+    # Send requests at 10-second intervals
+    for i in range(total_requests):
         # Calculate when this request should be sent
-        target_send_time = start_time + (i * 3)
+        target_send_time = start_time + (i * 0)
 
         # Wait until the target send time
         current_time = time.time()
@@ -170,46 +178,34 @@ def main():
 
     # Print summary
     total_time = time.time() - start_time
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print("Total requests sent: 6")
 
     with results_lock:
         successful = sum(1 for r in results.values() if r.get("success", False))
-        print(f"Successful responses: {successful}")
-        print(f"Failed requests: {6 - successful}")
+        failed = total_requests - successful
 
-    print(f"Total elapsed time: {total_time:.2f}s")
+        # Calculate Latencies
+        latencies = [r["elapsed_time"] for r in results.values() if r.get("success")]
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+        throughput = successful / total_time
 
-    with results_lock:
-        if results:
-            print("\nResults:")
-            with requests_lock:
-                for i, req_info in enumerate(requests_sent, 1):
-                    req_id = req_info["request_id"]
-                    if req_id in results:
-                        res_info = results[req_id]
-                        print(f"\n{i}. Request ID: {req_id}")
-                        print(f"   Query: {req_info['query'][:60]}...")
+    # ASCII Box
+    msg = [
+        "BENCHMARK COMPLETE",
+        f"Total Requests: {total_requests}",
+        f"Successful:     {successful}",
+        f"Failed:         {failed}",
+        f"Throughput:     {throughput:.2f} req/sec",
+        f"Avg Latency:    {avg_latency:.2f} sec",
+        f"Total Time:     {total_time:.2f} sec",
+    ]
 
-                        if res_info.get("success"):
-                            result = res_info["result"]
-                            print(f"   Success (took {res_info['elapsed_time']:.2f}s)")
-                            print(f"   Sentiment: {result.get('sentiment')}")
-                            print(f"   Is Toxic: {result.get('is_toxic')}")
-                            print(
-                                f"   Response: {result.get('generated_response', '')[:80]}..."
-                            )
-                        else:
-                            print(
-                                f"   Failed: {res_info.get('error', 'Unknown error')}"
-                            )
-                    else:
-                        print(f"\n{i}. Request ID: {req_id}")
-                        print("   ⏳ Still pending or not received")
-
-    print("\n" + "=" * 70)
+    width = 40
+    print("\n")
+    print("╔" + "═" * (width - 2) + "╗")
+    for line in msg:
+        print(f"║ {line:<{width - 4}} ║")
+    print("╚" + "═" * (width - 2) + "╝")
+    print("\n")
 
 
 if __name__ == "__main__":
