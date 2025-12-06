@@ -25,7 +25,7 @@ TOTAL_NODES = int(os.environ.get("TOTAL_NODES", 1))
 NODE_NUMBER = int(os.environ.get("NODE_NUMBER", 1))
 FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "faiss_index.bin")
 
-NODE_2_IP_RAW = os.environ.get("NODE_1_IP", "localhost:8002")
+NODE_2_IP_RAW = os.environ.get("NODE_2_IP", "localhost:8002")
 NODE_0_IP_RAW = os.environ.get("NODE_0_IP", "localhost:8000")  # ✨ 新增：Node0 地址
 NODE0_CALLBACK_PATH = "/retrieval_callback"  # ✨ 新增：回调路径
 
