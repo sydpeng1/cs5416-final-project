@@ -1,39 +1,50 @@
 import os
+# --- THREADING (Must be first) ---
+threads = os.environ.get("OMP_NUM_THREADS", "2")
+os.environ["OMP_NUM_THREADS"] = threads
+os.environ["MKL_NUM_THREADS"] = threads
+
 import time
 import threading
 import logging
-from concurrent.futures import ThreadPoolExecutor
-
 import requests
-import numpy as np
 import torch
 from queue import Queue, Empty
-from typing import List, Dict, Any
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
-from transformers import pipeline as hf_pipeline
+from dataclasses import dataclass
+from typing import List
+from inference_engine import InferenceWorker
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Network Env
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
 NODE_NUMBER = int(os.environ.get('NODE_NUMBER', 0))
 NODE_0_IP_RAW = os.environ.get('NODE_0_IP', 'localhost:8000')
 NODE_1_IP_RAW = os.environ.get('NODE_1_IP', 'localhost:8001')  # Default to 8001
 NODE_2_IP_RAW = os.environ.get('NODE_2_IP', 'localhost:8002')  # Default to 8002
+DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
-BATCH_SIZE = 16
-BATCH_TIMEOUT = 0.1
-TRUNCATE_LENGTH = 512
-MAX_WORKERS = 2
+# Tuning Parameters
+# Default values are for "Safe Local Dev"
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
+BATCH_TIMEOUT = float(os.environ.get("BATCH_TIMEOUT", "0.1"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
+GPU_MICRO_BATCH_SIZE = int(os.environ.get("GPU_MICRO_BATCH_SIZE", "1"))
 
 # Flask App
 app = Flask(__name__)
 request_queue = Queue()
 results = {}
 results_lock = threading.Lock()
+
+# Load Balance Counter
+batch_counter = 0
+counter_lock = threading.Lock()
 
 
 @dataclass
@@ -53,13 +64,6 @@ class PipelineResponse:
 
 
 class DistributedPipeline:
-    """
-    Orchestrator Node (Node 0):
-    1. Local: Embed Query
-    2. Remote (Node 1): Search Index -> Get Doc IDs
-    3. Remote (Node 2): Fetch + Rerank + Generate -> Get Text
-    4. Local: Sentiment + Safety Analysis
-    """
     def __init__(self):
         if torch.cuda.is_available():
             self.device = torch.device('cuda')
@@ -86,18 +90,12 @@ class DistributedPipeline:
         logger.info(f"Target Node 1 (Retrieval): {self.retrieval_url}")
         logger.info(f"Target Node 2 (Inference): {self.inference_url}")
 
-        # Load Lightweight Models
+        # Load Local-Only Models (Embedder)
         logger.info("Loading Embedder (Local)...")
         self.embedder = SentenceTransformer('BAAI/bge-base-en-v1.5', device=self.device_str)
 
-        logger.info("Loading Analysis Models (Local)...")
-        self.sentiment_pipe = hf_pipeline("sentiment-analysis",
-                                          model='nlptown/bert-base-multilingual-uncased-sentiment',
-                                          device=self.device)
-
-        self.safety_pipe = hf_pipeline("text-classification",
-                                       model='unitary/toxic-bert',
-                                       device=self.device)
+        logger.info("Loading Local Inference Worker...")
+        self.local_worker = InferenceWorker(micro_batch_size=GPU_MICRO_BATCH_SIZE)
 
         logger.info("Node 0 Ready.")
 
@@ -109,13 +107,20 @@ class DistributedPipeline:
         queries = [req.query for req in batch_requests]
         logger.info(f"--- Processing Batch of {batch_size} Requests ---")
 
+        # Load Balancer Decision: Round Robin
+        global batch_counter
+        with counter_lock:
+            batch_counter += 1
+            batch_counter_value = batch_counter
+            is_local_run = batch_counter_value % 2 != 0
+
         try:
-            # --- STEP 1: Embedding (Local) ---
+            # [1] Embed (Always Local)
             t0 = time.time()
             embeddings = self.embedder.encode(queries, normalize_embeddings=True, convert_to_numpy=True)
             logger.info(f"[1] Embeddings: {time.time() - t0:.3f}s")
 
-            # --- STEP 2: Retrieval (Node 1) ---
+            # [2] Retrieve (Always Remote Node 1)
             t0 = time.time()
             # Convert numpy to list for JSON serialization
             payload_n1 = {'embeddings': embeddings.tolist()}
@@ -124,50 +129,35 @@ class DistributedPipeline:
             doc_ids_batch = resp_n1.json()['doc_ids']
             logger.info(f"[2] Retrieval (Node 1): {time.time() - t0:.3f}s")
 
-            # --- STEP 3: Generation (Node 2) ---
+            # [3] Generate & Analyze (Load Balanced)
             t0 = time.time()
-            payload_n2 = {
-                'queries': queries,
-                'doc_ids': doc_ids_batch
-            }
-            resp_n2 = requests.post(self.inference_url, json=payload_n2, timeout=300)
-            resp_n2.raise_for_status()
-            responses_text = resp_n2.json()['responses']
-            logger.info(f"[3] Generation (Node 2): {time.time() - t0:.3f}s")
+            results_data = []
 
-            # --- STEP 4: Analysis (Local) ---
-            t0 = time.time()
-            # Truncate for BERT models to prevent errors
-            truncated_texts = [t[:TRUNCATE_LENGTH] for t in responses_text]
+            if is_local_run:
+                logger.info(f"[Batch {batch_counter_value}] Processing LOCALLY (Node 0)")
+                results_data = self.local_worker.run_pipeline(queries, doc_ids_batch)
+                logger.info(f"Local Generation + Analysis: {time.time() - t0:.3f}s")
+            else:
+                logger.info(f"[Batch {batch_counter_value}] Routing REMOTELY (Node 2)")
 
-            # Run Sentiment & Safety in parallel conceptually (sequential here for simplicity)
-            raw_sentiments = self.sentiment_pipe(truncated_texts)
-            raw_safety = self.safety_pipe(truncated_texts)
-
-            # Parse Results
-            sentiment_map = {
-                '1 star': 'very negative', '2 stars': 'negative',
-                '3 stars': 'neutral', '4 stars': 'positive', '5 stars': 'very positive'
-            }
-            final_sentiments = [sentiment_map.get(r['label'], 'neutral') for r in raw_sentiments]
-            is_toxic_flags = [r['score'] > 0.5 for r in raw_safety]
-
-            logger.info(f"[4] Analysis: {time.time() - t0:.3f}s")
+                payload_n2 = {'queries': queries, 'doc_ids': doc_ids_batch}
+                resp_n2 = requests.post(self.inference_url, json=payload_n2, timeout=300)
+                resp_n2.raise_for_status()
+                results_data = resp_n2.json()['results']
+                logger.info(f"Remote Generation + Analysis: {time.time() - t0:.3f}s")
 
             # --- Assemble Responses ---
             pipeline_responses = []
             total_duration = time.time() - start_time
 
             for i, req in enumerate(batch_requests):
-                # Individual request latency (approximate based on batch end)
-                req_latency = time.time() - req.timestamp
-
+                res = results_data[i]
                 pipeline_responses.append(PipelineResponse(
                     request_id=req.request_id,
-                    generated_response=responses_text[i],
-                    sentiment=final_sentiments[i],
-                    is_toxic="true" if is_toxic_flags[i] else "false",
-                    processing_time=req_latency
+                    generated_response=res.get('text'),
+                    sentiment=res.get('sentiment'),
+                    is_toxic=res.get('is_toxic', 'false'),
+                    processing_time=time.time() - req.timestamp
                 ))
 
             logger.info(f"Batch completed in {total_duration:.3f}s")
@@ -179,47 +169,6 @@ class DistributedPipeline:
 
 
 pipeline_instance = None
-
-
-def worker_loop():
-    global pipeline_instance
-    logger.info("Worker thread started. Waiting for requests...")
-
-    # Maximum 4 batches "in-flight
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
-    while True:
-        batch = []
-        try:
-            # 1. Blocking Get (Wait for first item)
-            first_req = request_queue.get()
-            if first_req is None: break  # Shutdown signal
-            batch.append(first_req)
-
-            # 2. Opportunistic Collection
-            # Try to grab more items if they are immediately available (up to BATCH_SIZE)
-            start_wait = time.time()
-            while len(batch) < BATCH_SIZE:
-                # Calculate remaining time in timeout window
-                remaining = BATCH_TIMEOUT - (time.time() - start_wait)
-                if remaining <= 0: break
-
-                try:
-                    # Non-blocking get (or very short timeout)
-                    req = request_queue.get(timeout=remaining)
-                    batch.append(req)
-                except Empty:
-                    break
-
-            # 3. Convert dicts to Request Objects
-            req_objects = [PipelineRequest(r['request_id'], r['query'], r['timestamp']) for r in batch]
-
-            # 4. SUBMIT TO THREAD POOL (Non-blocking!)
-            # The main loop immediately goes back to top to fetch next batch
-            executor.submit(run_batch_task, pipeline_instance, req_objects)
-
-        except Exception as e:
-            logger.error(f"Worker Loop Error: {e}")
 
 
 def run_batch_task(pipeline: DistributedPipeline, batch_reqs: List[PipelineRequest]):
@@ -255,6 +204,47 @@ def run_batch_task(pipeline: DistributedPipeline, batch_reqs: List[PipelineReque
     finally:
         for _ in batch_reqs:
             request_queue.task_done()
+
+
+def worker_loop():
+    global pipeline_instance
+    logger.info("Worker thread started. Waiting for requests...")
+
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+    while True:
+        batch = []
+        try:
+            # 1. Blocking Get (Wait for first item)
+            first_req = request_queue.get()
+            if first_req is None: break  # Shutdown signal
+            batch.append(first_req)
+
+            # 2. Opportunistic Collection
+            # Try to grab more items if they are immediately available (up to BATCH_SIZE)
+            start_wait = time.time()
+            while len(batch) < BATCH_SIZE:
+                # Calculate remaining time in timeout window
+                remaining = BATCH_TIMEOUT - (time.time() - start_wait)
+                if remaining <= 0: break
+
+                try:
+                    # Non-blocking get (or very short timeout)
+                    req = request_queue.get(timeout=remaining)
+                    batch.append(req)
+                except Empty:
+                    break
+
+            # 3. Convert dicts to Request Objects
+            req_objects = [PipelineRequest(r['request_id'], r['query'], r['timestamp']) for r in batch]
+
+            # 4. SUBMIT TO THREAD POOL (Non-blocking!)
+            # The main loop immediately goes back to top to fetch next batch
+            executor.submit(run_batch_task, pipeline_instance, req_objects)
+
+        except Exception as e:
+            logger.error(f"Worker Loop Error: {e}")
+
 
 # Routes
 @app.route('/query', methods=['POST'])
