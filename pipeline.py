@@ -13,15 +13,14 @@ if NODE_NUMBER == 0:
 
 elif NODE_NUMBER == 1:
     print("[pipeline.py] Launching Node1 retrieval...")
-    import rag_node
+    import rag_node1
 
-    rag_node.main()
+    rag_node1.main()
 
 elif NODE_NUMBER == 2:
     print("[pipeline.py] Launching Node2 generator...")
-    import rag_node
 
-    rag_node.main()
+    rag_node1.main()
 
 else:
     print(f"[pipeline.py] ERROR: Unknown NODE_NUMBER={NODE_NUMBER}")
