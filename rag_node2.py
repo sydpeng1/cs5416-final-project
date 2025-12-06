@@ -36,7 +36,7 @@ NODE_2_IP = os.environ.get("NODE_2_IP", "localhost:8002")
 
 DOCUMENTS_DB = os.environ.get("DOCUMENTS_DB", "documents/documents.db")
 
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 BATCH_TIMEOUT = 0.05
 
 MAX_QUEUE_SIZE = 2000
@@ -74,11 +74,15 @@ def load_models():
 
     logger.info("Loading LLM...")
     llm_tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    llm_tok.padding_side = 'left'
+    if llm_tok.pad_token is None:
+        llm_tok.pad_token = llm_tok.eos_token
+    
     dtype = torch.float16 if DEVICE.type == "cuda" else torch.float32
     llm_model = (
         AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen2.5-0.5B-Instruct",
-            dtype=dtype,
+            torch_dtype=dtype,
             use_cache=True,
         )
         .to(DEVICE)
@@ -140,39 +144,49 @@ def rerank(query: str, docs: List[Dict]):
     return [d for d, _ in scored]
 
 
-# ------------------------------------------------------------
-# LLM GENERATION
-# ------------------------------------------------------------
-def llm_generate(query: str, docs: List[Dict]):
-    ctx = "\n".join([f"- {d['title']}: {d['content'][:200]}" for d in docs[:3]])
-
-    messages = [
-        {"role": "system", "content": "Answer as 'Answer: <final>'"},
-        {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {query}\n\nAnswer:"},
-    ]
-
-    text = llm_tok.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-    inputs = llm_tok([text], return_tensors="pt", truncation=True, max_length=512).to(
-        DEVICE
-    )
-
+def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List[str]:
+    if not queries:
+        return []
+    
+    all_texts = []
+    for q, docs in zip(queries, docs_batch):
+        ctx = "\n".join([f"- {d['title']}: {d['content'][:200]}" for d in docs[:3]])
+        messages = [
+            {"role": "system", "content": "Answer as 'Answer: <final>'"},
+            {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {q}\n\nAnswer:"},
+        ]
+        text = llm_tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        all_texts.append(text)
+    
+    inputs = llm_tok(
+        all_texts, 
+        return_tensors="pt", 
+        truncation=True, 
+        max_length=512, 
+        padding=True
+    ).to(DEVICE)
+    
     with torch.no_grad():
         ids = llm_model.generate(
             **inputs,
             max_new_tokens=128,
             temperature=0.01,
             pad_token_id=llm_tok.eos_token_id,
+            do_sample=False,
         )
+    
+    input_len = inputs.input_ids.shape[1]
+    new_ids = ids[:, input_len:]
+    answers = llm_tok.batch_decode(new_ids, skip_special_tokens=True)
+    
+    return answers
 
-    new_ids = ids[:, inputs.input_ids.shape[1] :]
-    return llm_tok.batch_decode(new_ids, skip_special_tokens=True)[0]
 
 
 def callback_worker():
-    logger.info("Node2 callback_worker (BATCH MODE) started.")
+    logger.info("Node2 callback_worker (BATCH MODE with true batch LLM) started.")
 
     node0_callback_url = f"http://{NODE_0_IP}/final_callback"
     logger.info(f"Node2 will callback Node0 at: {node0_callback_url}")
@@ -180,7 +194,6 @@ def callback_worker():
     while True:
         batch = []
         try:
-            # ------- 1) blocking
             first = callback_queue.get()
             if first is None:
                 break
@@ -188,7 +201,6 @@ def callback_worker():
 
             start_t = time.time()
 
-            # ------- 2) opportunistic batching -------
             while len(batch) < BATCH_SIZE:
                 remain = BATCH_TIMEOUT - (time.time() - start_t)
                 if remain <= 0:
@@ -233,11 +245,9 @@ def callback_worker():
             )
 
             t_llm = time.time()
-            answers = []
-            for q, docs in zip(queries, reranked_batch):
-                answers.append(llm_generate(q, docs))
+            answers = llm_generate_batch(queries, reranked_batch)
             logger.info(
-                "[Node2] LLM batch_size=%d time=%.3fs",
+                "[Node2] LLM (true batch) batch_size=%d time=%.3fs",
                 batch_size,
                 time.time() - t_llm,
             )
@@ -279,7 +289,7 @@ def callback_worker():
                 time.time() - start_t,
             )
 
-            for rid, ans, s, tox in zip(request_ids, answers, sentiments, toxics):
+            def send_callback(rid, ans, s, tox):
                 payload = {
                     "request_id": rid,
                     "success": True,
@@ -294,6 +304,13 @@ def callback_worker():
                     )
                 except Exception as e:
                     logger.error(f"[Node2] Callback Node0 failed for {rid}: {e}")
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                futures = [
+                    executor.submit(send_callback, rid, ans, s, tox)
+                    for rid, ans, s, tox in zip(request_ids, answers, sentiments, toxics)
+                ]
+                for f in futures:
+                    f.result()
 
         except Exception as e:
             logger.error(f"callback_worker batch error: {e}")

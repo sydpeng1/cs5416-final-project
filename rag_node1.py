@@ -6,13 +6,13 @@ import time
 import threading
 from queue import Queue, Empty
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 
 import faiss
 import numpy as np
 from flask import Flask, request, jsonify
 import requests
 
-# Configure Logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configuration
 TOTAL_NODES = int(os.environ.get("TOTAL_NODES", 1))
 NODE_NUMBER = int(os.environ.get("NODE_NUMBER", 1))
 FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "faiss_index.bin")
@@ -34,15 +33,13 @@ CALLBACK_PATH = "/retrieval_callback"
 
 RETRIEVAL_K = 10
 
-# Async batch processing configuration
-BATCH_SIZE =  64
-BATCH_TIMEOUT = 0.05 
+BATCH_SIZE = 32
+BATCH_TIMEOUT = 0.05  
 MAX_QUEUE_SIZE = 500
 
 # Global state
 request_queue = Queue(maxsize=MAX_QUEUE_SIZE)
 
-# Round-robin index for callback
 rr_callback_idx = 0
 rr_callback_lock = threading.Lock()
 
@@ -92,6 +89,19 @@ def health():
     ), 200
 
 
+def send_callback(callback_node, payload):
+    callback_url = f"http://{callback_node}{CALLBACK_PATH}"
+    try:
+        resp = requests.post(callback_url, json=payload, timeout=10)
+        logger.info(
+            f"Callback to {callback_node} for {payload['request_id']} status={resp.status_code}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Callback failed for {payload['request_id']}: {e}")
+        return False
+
+
 def worker_loop():
     """Background worker that processes batched search requests and callback to Node0 or Node2"""
     logger.info("Node 1 Worker thread started. Waiting for search requests...")
@@ -101,7 +111,7 @@ def worker_loop():
         batch = []
         try:
             first_req = request_queue.get()
-            if first_req is None:  
+            if first_req is None: 
                 break
             batch.append(first_req)
 
@@ -134,29 +144,24 @@ def worker_loop():
 
             if index is None:
                 logger.error("Index not loaded!")
-                for req_dict in batch:
-                    callback_node = pick_callback_node()
-                    callback_url = f"http://{callback_node}{CALLBACK_PATH}"
-                    payload = {
-                        "request_id": req_dict["request_id"],
-                        "success": False,
-                        "error": "Index not ready",
-                        "doc_ids": [],
-                        "query": req_dict.get("query", ""),
-                    }
-                    try:
-                        requests.post(callback_url, json=payload, timeout=5)
-                    except Exception as e2:
-                        logger.error(
-                            f"Callback failed for {req_dict['request_id']}: {e2}"
-                        )
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    for req_dict in batch:
+                        callback_node = pick_callback_node()
+                        payload = {
+                            "request_id": req_dict["request_id"],
+                            "success": False,
+                            "error": "Index not ready",
+                            "doc_ids": [],
+                            "query": req_dict.get("query", ""),
+                        }
+                        executor.submit(send_callback, callback_node, payload)
                 for _ in batch:
                     request_queue.task_done()
                 continue
 
             collect_start = time.time()
             all_embeddings = []
-            request_mapping = []  # (request_id, embedding_index, query)
+            request_mapping = [] 
 
             for req_dict in batch:
                 try:
@@ -180,7 +185,6 @@ def worker_loop():
                     )
 
                     callback_node = pick_callback_node()
-                    callback_url = f"http://{callback_node}{CALLBACK_PATH}"
                     payload = {
                         "request_id": req_dict["request_id"],
                         "success": False,
@@ -188,12 +192,7 @@ def worker_loop():
                         "doc_ids": [],
                         "query": req_dict.get("query", ""),
                     }
-                    try:
-                        requests.post(callback_url, json=payload, timeout=5)
-                    except Exception as e2:
-                        logger.error(
-                            f"Callback failed for {req_dict['request_id']}: {e2}"
-                        )
+                    send_callback(callback_node, payload)
 
             if all_embeddings:
                 logger.info(
@@ -211,33 +210,38 @@ def worker_loop():
                     f"Batch search completed in {search_time:.3f}s for {len(all_embeddings)} queries"
                 )
 
-    
-                request_results = {}  
+                request_results = {} 
                 for (req_id, emb_idx, query), doc_ids in zip(request_mapping, indices):
                     if req_id not in request_results:
                         request_results[req_id] = {"doc_ids": [], "query": query}
                     request_results[req_id]["doc_ids"].append(doc_ids.tolist())
 
+
                 callback_start = time.time()
+                
+
+                callback_tasks = []
                 for req_id, result_data in request_results.items():
                     callback_node = pick_callback_node()
-                    callback_url = f"http://{callback_node}{CALLBACK_PATH}"
-                    
                     payload = {
                         "request_id": req_id,
                         "success": True,
                         "doc_ids": result_data["doc_ids"],
                         "query": result_data["query"],
                     }
-                    try:
-                        resp = requests.post(callback_url, json=payload, timeout=10)
-                        logger.info(
-                            f"Callback to {callback_node} for {req_id} status={resp.status_code}"
-                        )
-                    except Exception as e:
-                        logger.error(f"Callback failed for {req_id}: {e}")
+                    callback_tasks.append((callback_node, payload))
+                
+
+                with ThreadPoolExecutor(max_workers=32) as executor:
+                    futures = [
+                        executor.submit(send_callback, node, payload)
+                        for node, payload in callback_tasks
+                    ]
+                    for f in futures:
+                        f.result()
+                
                 logger.info(
-                    "Callbacks finished for batch_size=%d time=%.3fs",
+                    "Callbacks finished (parallel) for batch_size=%d time=%.3fs",
                     batch_size,
                     time.time() - callback_start,
                 )
@@ -253,22 +257,17 @@ def worker_loop():
         except Exception as e:
             logger.error(f"Worker loop error: {e}")
             try:
-                for req_dict in batch:
-                    callback_node = pick_callback_node()
-                    callback_url = f"http://{callback_node}{CALLBACK_PATH}"
-                    payload = {
-                        "request_id": req_dict["request_id"],
-                        "success": False,
-                        "error": str(e),
-                        "doc_ids": [],
-                        "query": req_dict.get("query", ""),
-                    }
-                    try:
-                        requests.post(callback_url, json=payload, timeout=5)
-                    except Exception as e2:
-                        logger.error(
-                            f"Callback failed for {req_dict['request_id']}: {e2}"
-                        )
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    for req_dict in batch:
+                        callback_node = pick_callback_node()
+                        payload = {
+                            "request_id": req_dict["request_id"],
+                            "success": False,
+                            "error": str(e),
+                            "doc_ids": [],
+                            "query": req_dict.get("query", ""),
+                        }
+                        executor.submit(send_callback, callback_node, payload)
             finally:
                 for _ in batch:
                     request_queue.task_done()

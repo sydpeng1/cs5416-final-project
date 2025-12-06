@@ -19,9 +19,6 @@ from transformers import (
     pipeline as hf_pipeline,
 )
 
-# ------------------------------------------------------------
-# LOGGING
-# ------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -29,9 +26,6 @@ logger = logging.getLogger("Node0")
 
 app = Flask(__name__)
 
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
 NODE_0_IP = os.environ.get("NODE_0_IP", "localhost:8000")
 NODE_1_IP = os.environ.get("NODE_1_IP", "localhost:8001")
 NODE_2_IP = os.environ.get("NODE_2_IP", "localhost:8002")
@@ -40,10 +34,10 @@ FAISS_NODE = NODE_1_IP
 
 DOCUMENTS_DB = os.environ.get("DOCUMENTS_DB", "documents/documents.db")
 
-EMBED_BATCH_SIZE = 64
+EMBED_BATCH_SIZE = 32
 EMBED_BATCH_TIMEOUT = 0.05
 
-LLM_BATCH_SIZE = 4  # optional batching
+LLM_BATCH_SIZE = 8
 
 MAX_QUEUE_SIZE = 2000
 
@@ -72,9 +66,6 @@ sent_pipe = None
 safe_pipe = None
 
 
-# ------------------------------------------------------------
-# LOAD MODELS
-# ------------------------------------------------------------
 def load_models():
     global \
         embedder, \
@@ -100,11 +91,15 @@ def load_models():
 
     logger.info("Loading LLM...")
     llm_tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    llm_tok.padding_side = 'left'
+    if llm_tok.pad_token is None:
+        llm_tok.pad_token = llm_tok.eos_token
+    
     dtype = torch.float16 if DEVICE.type == "cuda" else torch.float32
     llm_model = (
         AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen2.5-0.5B-Instruct",
-            dtype=dtype,
+            torch_dtype=dtype,
             use_cache=True,
         )
         .to(DEVICE)
@@ -126,9 +121,7 @@ def load_models():
     logger.info("All models loaded.")
 
 
-# ------------------------------------------------------------
-# FETCH DOCUMENTS
-# ------------------------------------------------------------
+
 def fetch_docs(doc_ids: List[int]):
     db = DOCUMENTS_DB
     if not os.path.exists(db):
@@ -148,9 +141,7 @@ def fetch_docs(doc_ids: List[int]):
     return [out[i] for i in doc_ids if i in out]
 
 
-# ------------------------------------------------------------
-# RERANK
-# ------------------------------------------------------------
+
 def rerank(query: str, docs: List[Dict]):
     if not docs:
         return []
@@ -166,24 +157,30 @@ def rerank(query: str, docs: List[Dict]):
     return [d for d, _ in scored]
 
 
-# ------------------------------------------------------------
-# LLM GENERATION
-# ------------------------------------------------------------
-def llm_generate(query: str, docs: List[Dict]):
-    ctx = "\n".join([f"- {d['title']}: {d['content'][:200]}" for d in docs[:3]])
+def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List[str]:
+    if not queries:
+        return []
 
-    messages = [
-        {"role": "system", "content": "Answer as 'Answer: <final>'"},
-        {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {query}\n\nAnswer:"},
-    ]
-
-    text = llm_tok.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-    inputs = llm_tok([text], return_tensors="pt", truncation=True, max_length=512).to(
-        DEVICE
-    )
+    all_texts = []
+    for q, docs in zip(queries, docs_batch):
+        ctx = "\n".join([f"- {d['title']}: {d['content'][:200]}" for d in docs[:3]])
+        messages = [
+            {"role": "system", "content": "Answer as 'Answer: <final>'"},
+            {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {q}\n\nAnswer:"},
+        ]
+        text = llm_tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        all_texts.append(text)
+    
+    inputs = llm_tok(
+        all_texts, 
+        return_tensors="pt", 
+        truncation=True, 
+        max_length=512, 
+        padding=True
+    ).to(DEVICE)
+    
 
     with torch.no_grad():
         ids = llm_model.generate(
@@ -191,31 +188,14 @@ def llm_generate(query: str, docs: List[Dict]):
             max_new_tokens=128,
             temperature=0.01,
             pad_token_id=llm_tok.eos_token_id,
+            do_sample=False,
         )
 
-    new_ids = ids[:, inputs.input_ids.shape[1] :]
-    return llm_tok.batch_decode(new_ids, skip_special_tokens=True)[0]
-
-
-# ------------------------------------------------------------
-# ANALYSIS
-# ------------------------------------------------------------
-def analyze(text: str):
-    sent = sent_pipe(text[:512])[0]
-    safe = safe_pipe(text[:512])[0]
-
-    star_to_sent = {
-        "1 star": "very negative",
-        "2 stars": "negative",
-        "3 stars": "neutral",
-        "4 stars": "positive",
-        "5 stars": "very positive",
-    }
-
-    sentiment = star_to_sent.get(sent["label"], "neutral")
-    toxic = safe["score"] > 0.5
-
-    return sentiment, toxic
+    input_len = inputs.input_ids.shape[1]
+    new_ids = ids[:, input_len:]
+    answers = llm_tok.batch_decode(new_ids, skip_special_tokens=True)
+    
+    return answers
 
 
 # ------------------------------------------------------------
@@ -258,7 +238,6 @@ def embed_worker():
                 time.time() - t0,
             )
 
-            # 发送到唯一的 FAISS node (Node1)
             for i, r in enumerate(batch):
                 host, port = FAISS_NODE.split(":")
                 url = f"http://{host}:{port}/search"
@@ -266,7 +245,7 @@ def embed_worker():
                 payload = {
                     "request_id": r["request_id"],
                     "embeddings": embs[i].tolist(),
-                    "query": r["query"],  # 传递 query 给 Node1
+                    "query": r["query"],  
                 }
 
                 try:
@@ -297,9 +276,9 @@ def embed_worker():
 
 
 def callback_worker():
-    logger.info("callback_worker (BATCH MODE) started.")
+    logger.info("callback_worker (BATCH MODE with true batch LLM) started.")
 
-    BATCH_SIZE = 16
+    BATCH_SIZE = 8
     BATCH_TIMEOUT = 0.05
 
     while True:
@@ -311,8 +290,6 @@ def callback_worker():
             batch.append(first)
 
             start_t = time.time()
-
-            # ------- 2) opportunistic batching -------
             while len(batch) < BATCH_SIZE:
                 remain = BATCH_TIMEOUT - (time.time() - start_t)
                 if remain <= 0:
@@ -327,7 +304,8 @@ def callback_worker():
                     break
 
             batch_size = len(batch)
-            logger.info(f"Callback batch size = {batch_size}")
+            logger.info(f"[Node0] Callback batch size = {batch_size}")
+
 
             request_ids = [b["request_id"] for b in batch]
             queries = []
@@ -336,8 +314,10 @@ def callback_worker():
             with pending_q_lock:
                 for item in batch:
                     req_id = item["request_id"]
+
                     q = item.get("query") or pending_queries.get(req_id, None)
                     queries.append(q)
+
                     doc_ids_batch.append(item["doc_ids"][0] if item["doc_ids"] else [])
 
             t_fetch = time.time()
@@ -361,11 +341,9 @@ def callback_worker():
             )
 
             t_llm = time.time()
-            answers = []
-            for q, docs in zip(queries, reranked_batch):
-                answers.append(llm_generate(q, docs))
+            answers = llm_generate_batch(queries, reranked_batch)
             logger.info(
-                "[Node0] LLM batch_size=%d time=%.3fs",
+                "[Node0] LLM (true batch) batch_size=%d time=%.3fs",
                 batch_size,
                 time.time() - t_llm,
             )
@@ -424,7 +402,9 @@ def callback_worker():
                 callback_queue.task_done()
 
 
-
+# ------------------------------------------------------------
+# ROUTES
+# ------------------------------------------------------------
 @app.route("/query", methods=["POST"])
 def query_api():
     data = request.json or {}
@@ -459,7 +439,7 @@ def retrieval_callback():
     rid = data.get("request_id")
     success = data.get("success")
     doc_ids = data.get("doc_ids", [])
-    query = data.get("query", "")
+    query = data.get("query", "")  
 
     if not rid:
         return jsonify({"error": "missing request_id"}), 400
@@ -485,6 +465,7 @@ def retrieval_callback():
 
 @app.route("/final_callback", methods=["POST"])
 def final_callback():
+
     data = request.json or {}
     rid = data.get("request_id")
     success = data.get("success", False)
