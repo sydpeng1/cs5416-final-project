@@ -25,7 +25,7 @@ TOTAL_NODES = int(os.environ.get("TOTAL_NODES", 1))
 NODE_NUMBER = int(os.environ.get("NODE_NUMBER", 1))
 FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "faiss_index.bin")
 
-NODE_1_IP_RAW = os.environ.get("NODE_1_IP", "localhost:8001")
+NODE_2_IP_RAW = os.environ.get("NODE_1_IP", "localhost:8002")
 NODE_0_IP_RAW = os.environ.get("NODE_0_IP", "localhost:8000")  # ✨ 新增：Node0 地址
 NODE0_CALLBACK_PATH = "/retrieval_callback"  # ✨ 新增：回调路径
 
@@ -293,8 +293,8 @@ def main():
     worker_thread.start()
     logger.info("Node 1 worker thread started")
 
-    hostname = NODE_1_IP_RAW.split(":")[0]
-    port = int(NODE_1_IP_RAW.split(":")[1]) if ":" in NODE_1_IP_RAW else 8001
+    hostname = NODE_2_IP_RAW.split(":")[0]
+    port = int(NODE_2_IP_RAW.split(":")[1]) if ":" in NODE_2_IP_RAW else 8001
 
     logger.info(f"Node 1 Retrieval Service starting on {hostname}:{port}")
 
