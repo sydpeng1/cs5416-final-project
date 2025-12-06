@@ -7,11 +7,15 @@ import threading
 from queue import Queue, Empty
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Tuple
 
 import faiss
 import numpy as np
+import sqlite3
+import torch
 from flask import Flask, request, jsonify
 import requests
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -23,6 +27,7 @@ app = Flask(__name__)
 TOTAL_NODES = int(os.environ.get("TOTAL_NODES", 1))
 NODE_NUMBER = int(os.environ.get("NODE_NUMBER", 1))
 FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "faiss_index.bin")
+DOCUMENTS_DB = os.environ.get("DOCUMENTS_DB", "documents/documents.db")
 
 NODE_1_IP_RAW = os.environ.get("NODE_1_IP", "localhost:8001")
 NODE_0_IP_RAW = os.environ.get("NODE_0_IP", "localhost:8000")
@@ -33,15 +38,20 @@ CALLBACK_PATH = "/retrieval_callback"
 
 RETRIEVAL_K = 10
 
-BATCH_SIZE = 32
-BATCH_TIMEOUT = 0.05  
+BATCH_SIZE = 8
+BATCH_TIMEOUT = 0.05
 MAX_QUEUE_SIZE = 500
 
-# Global state
 request_queue = Queue(maxsize=MAX_QUEUE_SIZE)
 
 rr_callback_idx = 0
 rr_callback_lock = threading.Lock()
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+index = None
+reranker_model = None
+reranker_tok = None
 
 
 @dataclass
@@ -53,7 +63,6 @@ class SearchRequest:
 
 
 def pick_callback_node():
-    """Round-robin 选择 callback 节点（Node0 或 Node2）"""
     global rr_callback_idx
     with rr_callback_lock:
         node = CALLBACK_NODES[rr_callback_idx % len(CALLBACK_NODES)]
@@ -74,12 +83,90 @@ def load_index():
         logger.info("FAISS Index loaded successfully.")
         logger.info(f"   - Vectors: {index.ntotal}")
         logger.info(f"   - Dimensions: {index.d}")
-
         gc.collect()
-
     except Exception as e:
         logger.error(f"FATAL: Failed to read FAISS index: {e}")
         sys.exit(1)
+
+
+def load_reranker():
+    global reranker_tok, reranker_model
+    logger.info("Loading reranker model...")
+    reranker_tok = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
+    reranker_model = (
+        AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
+        .to(DEVICE)
+        .eval()
+    )
+    logger.info("Reranker model loaded.")
+
+
+def fetch_docs_bulk(all_doc_ids: List[int]) -> Dict[int, Dict]:
+    if not all_doc_ids:
+        return {}
+    
+    db = DOCUMENTS_DB
+    if not os.path.exists(db):
+        return {}
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    unique_ids = list(set(all_doc_ids))
+    placeholders = ",".join("?" for _ in unique_ids)
+    q = f"SELECT doc_id, title, content FROM documents WHERE doc_id IN ({placeholders})"
+    cur.execute(q, unique_ids)
+
+    out = {row["doc_id"]: dict(row) for row in cur.fetchall()}
+    conn.close()
+
+    return out
+
+
+def get_docs_for_request(doc_ids: List[int], docs_cache: Dict[int, Dict]) -> List[Dict]:
+    return [docs_cache[i] for i in doc_ids if i in docs_cache]
+
+
+def rerank_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List[List[Dict]]:
+    if not queries:
+        return []
+    
+    all_pairs = []
+    pair_mapping = []
+    
+    for req_idx, (query, docs) in enumerate(zip(queries, docs_batch)):
+        for doc_idx, doc in enumerate(docs):
+            all_pairs.append([query, doc["content"]])
+            pair_mapping.append((req_idx, doc_idx))
+    
+    if not all_pairs:
+        return [[] for _ in queries]
+    
+    with torch.no_grad():
+        tok = reranker_tok(
+            all_pairs, truncation=True, padding=True, return_tensors="pt"
+        ).to(DEVICE)
+        all_logits = reranker_model(**tok).logits.squeeze(-1).cpu().numpy()
+    
+    if all_logits.ndim == 0:
+        all_logits = np.array([float(all_logits)])
+    
+    request_scores: List[List[Tuple[int, float]]] = [[] for _ in queries]
+    for pair_idx, (req_idx, doc_idx) in enumerate(pair_mapping):
+        request_scores[req_idx].append((doc_idx, float(all_logits[pair_idx])))
+    
+    reranked_batch = []
+    for req_idx, docs in enumerate(docs_batch):
+        if not docs:
+            reranked_batch.append([])
+            continue
+        scores = request_scores[req_idx]
+        sorted_indices = sorted(scores, key=lambda x: x[1], reverse=True)
+        reranked = [docs[idx] for idx, _ in sorted_indices]
+        reranked_batch.append(reranked)
+    
+    return reranked_batch
 
 
 @app.route("/health", methods=["GET"])
@@ -103,7 +190,6 @@ def send_callback(callback_node, payload):
 
 
 def worker_loop():
-    """Background worker that processes batched search requests and callback to Node0 or Node2"""
     logger.info("Node 1 Worker thread started. Waiting for search requests...")
     logger.info(f"Node1 will round-robin callback to: {CALLBACK_NODES}")
 
@@ -111,7 +197,7 @@ def worker_loop():
         batch = []
         try:
             first_req = request_queue.get()
-            if first_req is None: 
+            if first_req is None:
                 break
             batch.append(first_req)
 
@@ -151,7 +237,7 @@ def worker_loop():
                             "request_id": req_dict["request_id"],
                             "success": False,
                             "error": "Index not ready",
-                            "doc_ids": [],
+                            "docs": [],
                             "query": req_dict.get("query", ""),
                         }
                         executor.submit(send_callback, callback_node, payload)
@@ -161,7 +247,7 @@ def worker_loop():
 
             collect_start = time.time()
             all_embeddings = []
-            request_mapping = [] 
+            request_mapping = []
 
             for req_dict in batch:
                 try:
@@ -183,13 +269,12 @@ def worker_loop():
                     logger.error(
                         f"Error processing request {req_dict['request_id']}: {e}"
                     )
-
                     callback_node = pick_callback_node()
                     payload = {
                         "request_id": req_dict["request_id"],
                         "success": False,
                         "error": str(e),
-                        "doc_ids": [],
+                        "docs": [],
                         "query": req_dict.get("query", ""),
                     }
                     send_callback(callback_node, payload)
@@ -210,28 +295,53 @@ def worker_loop():
                     f"Batch search completed in {search_time:.3f}s for {len(all_embeddings)} queries"
                 )
 
-                request_results = {} 
+                request_results = {}
                 for (req_id, emb_idx, query), doc_ids in zip(request_mapping, indices):
                     if req_id not in request_results:
                         request_results[req_id] = {"doc_ids": [], "query": query}
-                    request_results[req_id]["doc_ids"].append(doc_ids.tolist())
+                    request_results[req_id]["doc_ids"].extend(doc_ids.tolist())
 
+                t_fetch = time.time()
+                all_doc_ids = []
+                for req_id, data in request_results.items():
+                    all_doc_ids.extend(data["doc_ids"])
+                
+                docs_cache = fetch_docs_bulk(all_doc_ids)
+                
+                queries_list = []
+                docs_batch = []
+                req_ids_list = list(request_results.keys())
+                
+                for req_id in req_ids_list:
+                    data = request_results[req_id]
+                    queries_list.append(data["query"])
+                    docs_batch.append(get_docs_for_request(data["doc_ids"], docs_cache))
+                
+                logger.info(
+                    "Fetch docs batch_size=%d unique_docs=%d time=%.3fs",
+                    batch_size, len(docs_cache), time.time() - t_fetch,
+                )
+
+                t_rerank = time.time()
+                reranked_batch = rerank_batch(queries_list, docs_batch)
+                logger.info(
+                    "Rerank batch_size=%d time=%.3fs",
+                    batch_size, time.time() - t_rerank,
+                )
 
                 callback_start = time.time()
-                
-
                 callback_tasks = []
-                for req_id, result_data in request_results.items():
+                for req_id, query, reranked_docs in zip(req_ids_list, queries_list, reranked_batch):
                     callback_node = pick_callback_node()
+                    top_docs = reranked_docs[:3]
                     payload = {
                         "request_id": req_id,
                         "success": True,
-                        "doc_ids": result_data["doc_ids"],
-                        "query": result_data["query"],
+                        "docs": top_docs,
+                        "query": query,
                     }
                     callback_tasks.append((callback_node, payload))
                 
-
                 with ThreadPoolExecutor(max_workers=32) as executor:
                     futures = [
                         executor.submit(send_callback, node, payload)
@@ -264,7 +374,7 @@ def worker_loop():
                             "request_id": req_dict["request_id"],
                             "success": False,
                             "error": str(e),
-                            "doc_ids": [],
+                            "docs": [],
                             "query": req_dict.get("query", ""),
                         }
                         executor.submit(send_callback, callback_node, payload)
@@ -281,7 +391,7 @@ def search():
             return jsonify({"error": "Missing request_id or embeddings"}), 400
 
         request_id = data["request_id"]
-        query = data.get("query", "") 
+        query = data.get("query", "")
 
         try:
             request_queue.put(
@@ -303,11 +413,9 @@ def search():
         return jsonify({"error": str(e)}), 500
 
 
-index = None
-
-
 def main():
     load_index()
+    load_reranker()
 
     worker_thread = threading.Thread(target=worker_loop, daemon=True)
     worker_thread.start()

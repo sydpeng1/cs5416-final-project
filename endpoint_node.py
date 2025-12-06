@@ -7,14 +7,12 @@ from queue import Queue, Empty
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 import requests
-import sqlite3
 import torch
 
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
 from transformers import (
     AutoTokenizer,
-    AutoModelForSequenceClassification,
     AutoModelForCausalLM,
     pipeline as hf_pipeline,
 )
@@ -32,34 +30,32 @@ NODE_2_IP = os.environ.get("NODE_2_IP", "localhost:8002")
 
 FAISS_NODE = NODE_1_IP
 
-DOCUMENTS_DB = os.environ.get("DOCUMENTS_DB", "documents/documents.db")
-
 EMBED_BATCH_SIZE = 32
 EMBED_BATCH_TIMEOUT = 0.05
 
-LLM_BATCH_SIZE = 8
+CALLBACK_BATCH_SIZE = 8
+CALLBACK_BATCH_TIMEOUT = 0.05
+
+NUM_CALLBACK_WORKERS = 2
 
 MAX_QUEUE_SIZE = 2000
 
-# ------------------------------------------------------------
-# GLOBAL STATE
-# ------------------------------------------------------------
 embedding_queue = Queue(maxsize=MAX_QUEUE_SIZE)
 callback_queue = Queue(maxsize=MAX_QUEUE_SIZE)
 
 results: Dict[str, Dict[str, Any]] = {}
 results_lock = threading.Lock()
 
+result_events: Dict[str, threading.Event] = {}
+events_lock = threading.Lock()
+
 pending_queries: Dict[str, str] = {}
 pending_q_lock = threading.Lock()
 
-# Models
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE_INT = 0 if torch.cuda.is_available() else -1
 
 embedder = None
-reranker_model = None
-reranker_tok = None
 llm_model = None
 llm_tok = None
 sent_pipe = None
@@ -67,26 +63,11 @@ safe_pipe = None
 
 
 def load_models():
-    global \
-        embedder, \
-        reranker_tok, \
-        reranker_model, \
-        llm_tok, \
-        llm_model, \
-        sent_pipe, \
-        safe_pipe
+    global embedder, llm_tok, llm_model, sent_pipe, safe_pipe
 
     logger.info("Loading embedding model...")
     embedder = SentenceTransformer(
         "BAAI/bge-base-en-v1.5", device=("cuda" if torch.cuda.is_available() else "cpu")
-    )
-
-    logger.info("Loading reranker...")
-    reranker_tok = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
-    reranker_model = (
-        AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
-        .to(DEVICE)
-        .eval()
     )
 
     logger.info("Loading LLM...")
@@ -121,46 +102,10 @@ def load_models():
     logger.info("All models loaded.")
 
 
-
-def fetch_docs(doc_ids: List[int]):
-    db = DOCUMENTS_DB
-    if not os.path.exists(db):
-        return []
-
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    placeholders = ",".join("?" for _ in doc_ids)
-    q = f"SELECT doc_id, title, content FROM documents WHERE doc_id IN ({placeholders})"
-    cur.execute(q, doc_ids)
-
-    out = {row["doc_id"]: dict(row) for row in cur.fetchall()}
-    conn.close()
-
-    return [out[i] for i in doc_ids if i in out]
-
-
-
-def rerank(query: str, docs: List[Dict]):
-    if not docs:
-        return []
-
-    pairs = [[query, d["content"]] for d in docs]
-    with torch.no_grad():
-        tok = reranker_tok(
-            pairs, truncation=True, padding=True, return_tensors="pt"
-        ).to(DEVICE)
-        logits = reranker_model(**tok).logits.squeeze(-1).cpu().numpy()
-
-    scored = sorted(zip(docs, logits.tolist()), key=lambda x: x[1], reverse=True)
-    return [d for d, _ in scored]
-
-
 def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List[str]:
     if not queries:
         return []
-
+    
     all_texts = []
     for q, docs in zip(queries, docs_batch):
         ctx = "\n".join([f"- {d['title']}: {d['content'][:200]}" for d in docs[:3]])
@@ -181,7 +126,6 @@ def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List
         padding=True
     ).to(DEVICE)
     
-
     with torch.no_grad():
         ids = llm_model.generate(
             **inputs,
@@ -190,7 +134,7 @@ def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List
             pad_token_id=llm_tok.eos_token_id,
             do_sample=False,
         )
-
+    
     input_len = inputs.input_ids.shape[1]
     new_ids = ids[:, input_len:]
     answers = llm_tok.batch_decode(new_ids, skip_special_tokens=True)
@@ -198,9 +142,15 @@ def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List
     return answers
 
 
-# ------------------------------------------------------------
-# EMBEDDING WORKER
-# ------------------------------------------------------------
+def set_result(req_id: str, result: Dict):
+    with results_lock:
+        results[req_id] = result
+    
+    with events_lock:
+        if req_id in result_events:
+            result_events[req_id].set()
+
+
 def embed_worker():
     logger.info("embed_worker started.")
 
@@ -226,7 +176,6 @@ def embed_worker():
             logger.info(f"[Node0] Embedding batch size={batch_size}")
 
             queries = [b["query"] for b in batch]
-            req_ids = [b["request_id"] for b in batch]
 
             t0 = time.time()
             embs = embedder.encode(
@@ -238,35 +187,29 @@ def embed_worker():
                 time.time() - t0,
             )
 
-            for i, r in enumerate(batch):
+            def send_to_node1(idx, r):
                 host, port = FAISS_NODE.split(":")
                 url = f"http://{host}:{port}/search"
-
                 payload = {
                     "request_id": r["request_id"],
-                    "embeddings": embs[i].tolist(),
-                    "query": r["query"],  
+                    "embeddings": embs[idx].tolist(),
+                    "query": r["query"],
                 }
-
                 try:
                     resp = requests.post(url, json=payload, timeout=3)
                     if resp.status_code != 202:
                         logger.error(
-                            "[Node0] FAISS POST failed req_id=%s url=%s status=%s body=%s",
+                            "[Node0] FAISS POST failed req_id=%s status=%s",
                             r["request_id"],
-                            url,
                             resp.status_code,
-                            resp.text,
                         )
                 except Exception as e:
-                    logger.error(
-                        "[Node0] Error sending req_id=%s to %s: %s",
-                        r["request_id"],
-                        url,
-                        e,
-                    )
-                    with results_lock:
-                        results[r["request_id"]] = {"success": False, "error": str(e)}
+                    logger.error("[Node0] Error sending req_id=%s: %s", r["request_id"], e)
+                    set_result(r["request_id"], {"success": False, "error": str(e)})
+
+            with ThreadPoolExecutor(max_workers=32) as executor:
+                for i, r in enumerate(batch):
+                    executor.submit(send_to_node1, i, r)
 
             for _ in batch:
                 embedding_queue.task_done()
@@ -275,11 +218,8 @@ def embed_worker():
             logger.error(f"embed_worker error: {e}")
 
 
-def callback_worker():
-    logger.info("callback_worker (BATCH MODE with true batch LLM) started.")
-
-    BATCH_SIZE = 8
-    BATCH_TIMEOUT = 0.05
+def callback_worker(worker_id: int):
+    logger.info(f"callback_worker-{worker_id} started.")
 
     while True:
         batch = []
@@ -290,8 +230,9 @@ def callback_worker():
             batch.append(first)
 
             start_t = time.time()
-            while len(batch) < BATCH_SIZE:
-                remain = BATCH_TIMEOUT - (time.time() - start_t)
+
+            while len(batch) < CALLBACK_BATCH_SIZE:
+                remain = CALLBACK_BATCH_TIMEOUT - (time.time() - start_t)
                 if remain <= 0:
                     break
 
@@ -304,48 +245,17 @@ def callback_worker():
                     break
 
             batch_size = len(batch)
-            logger.info(f"[Node0] Callback batch size = {batch_size}")
-
+            logger.info(f"[Node0-Worker{worker_id}] Callback batch size = {batch_size}")
 
             request_ids = [b["request_id"] for b in batch]
-            queries = []
-            doc_ids_batch = []
-
-            with pending_q_lock:
-                for item in batch:
-                    req_id = item["request_id"]
-
-                    q = item.get("query") or pending_queries.get(req_id, None)
-                    queries.append(q)
-
-                    doc_ids_batch.append(item["doc_ids"][0] if item["doc_ids"] else [])
-
-            t_fetch = time.time()
-            all_docs_batch = []
-            for doc_ids in doc_ids_batch:
-                all_docs_batch.append(fetch_docs(doc_ids))
-            logger.info(
-                "[Node0] Fetch docs batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_fetch,
-            )
-
-            t_rerank = time.time()
-            reranked_batch = []
-            for q, docs in zip(queries, all_docs_batch):
-                reranked_batch.append(rerank(q, docs))
-            logger.info(
-                "[Node0] Rerank batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_rerank,
-            )
+            queries = [b["query"] for b in batch]
+            docs_batch = [b["docs"] for b in batch]
 
             t_llm = time.time()
-            answers = llm_generate_batch(queries, reranked_batch)
+            answers = llm_generate_batch(queries, docs_batch)
             logger.info(
-                "[Node0] LLM (true batch) batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_llm,
+                "[Node0-Worker%d] LLM (true batch) batch_size=%d time=%.3fs",
+                worker_id, batch_size, time.time() - t_llm,
             )
 
             t_analysis = time.time()
@@ -363,9 +273,8 @@ def callback_worker():
                 sent_raw = sentiment_future.result()
                 safe_raw = safety_future.result()
             logger.info(
-                "[Node0] Analysis batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_analysis,
+                "[Node0-Worker%d] Analysis batch_size=%d time=%.3fs",
+                worker_id, batch_size, time.time() - t_analysis,
             )
 
             sent_map = {
@@ -380,31 +289,28 @@ def callback_worker():
             toxics = ["true" if x["score"] > 0.5 else "false" for x in safe_raw]
 
             logger.info(
-                "[Node0] Callback batch size=%d complete total_time=%.3fs",
-                batch_size,
-                time.time() - start_t,
+                "[Node0-Worker%d] Callback batch complete total_time=%.3fs",
+                worker_id, time.time() - start_t,
             )
 
-            with results_lock:
-                for rid, ans, s, tox in zip(request_ids, answers, sentiments, toxics):
-                    results[rid] = {
-                        "success": True,
-                        "generated_response": ans,
-                        "sentiment": s,
-                        "is_toxic": tox,
-                    }
+            for rid, ans, s, tox in zip(request_ids, answers, sentiments, toxics):
+                set_result(rid, {
+                    "success": True,
+                    "generated_response": ans,
+                    "sentiment": s,
+                    "is_toxic": tox,
+                })
 
         except Exception as e:
-            logger.error(f"callback_worker batch error: {e}")
+            logger.error(f"callback_worker-{worker_id} batch error: {e}")
+            for item in batch:
+                set_result(item["request_id"], {"success": False, "error": str(e)})
 
         finally:
             for _ in batch:
                 callback_queue.task_done()
 
 
-# ------------------------------------------------------------
-# ROUTES
-# ------------------------------------------------------------
 @app.route("/query", methods=["POST"])
 def query_api():
     data = request.json or {}
@@ -414,6 +320,10 @@ def query_api():
     if not req_id or not query:
         return jsonify({"error": "missing request_id or query"}), 400
 
+    event = threading.Event()
+    with events_lock:
+        result_events[req_id] = event
+
     with pending_q_lock:
         pending_queries[req_id] = query
 
@@ -421,14 +331,18 @@ def query_api():
         results.pop(req_id, None)
 
     embedding_queue.put({"request_id": req_id, "query": query})
-    start = time.time()
 
-    # wait for callback_worker to finish
-    while time.time() - start < 300:
+    finished = event.wait(timeout=300)
+
+    with events_lock:
+        result_events.pop(req_id, None)
+
+    if finished:
         with results_lock:
-            if req_id in results:
-                return jsonify(results.pop(req_id)), 200
-        time.sleep(0.05)
+            result = results.pop(req_id, None)
+        if result:
+            return jsonify(result), 200
+        return jsonify({"error": "result not found"}), 500
 
     return jsonify({"error": "timeout"}), 504
 
@@ -438,34 +352,30 @@ def retrieval_callback():
     data = request.json or {}
     rid = data.get("request_id")
     success = data.get("success")
-    doc_ids = data.get("doc_ids", [])
-    query = data.get("query", "")  
+    docs = data.get("docs", [])
+    query = data.get("query", "")
 
     if not rid:
         return jsonify({"error": "missing request_id"}), 400
 
     if not success:
-        with results_lock:
-            results[rid] = {
-                "success": False,
-                "error": data.get("error", "retrieval failed"),
-            }
+        set_result(rid, {
+            "success": False,
+            "error": data.get("error", "retrieval failed"),
+        })
         return jsonify({"status": "ok"}), 200
 
-    callback_queue.put(
-        {
-            "request_id": rid,
-            "doc_ids": doc_ids,
-            "query": query,
-        }
-    )
+    callback_queue.put({
+        "request_id": rid,
+        "docs": docs,
+        "query": query,
+    })
 
     return jsonify({"status": "queued"}), 200
 
 
 @app.route("/final_callback", methods=["POST"])
 def final_callback():
-
     data = request.json or {}
     rid = data.get("request_id")
     success = data.get("success", False)
@@ -473,31 +383,31 @@ def final_callback():
     if not rid:
         return jsonify({"error": "missing request_id"}), 400
 
-    with results_lock:
-        if success:
-            results[rid] = {
-                "success": True,
-                "generated_response": data.get("generated_response", ""),
-                "sentiment": data.get("sentiment", "neutral"),
-                "is_toxic": data.get("is_toxic", "false"),
-            }
-        else:
-            results[rid] = {
-                "success": False,
-                "error": data.get("error", "processing failed"),
-            }
+    if success:
+        set_result(rid, {
+            "success": True,
+            "generated_response": data.get("generated_response", ""),
+            "sentiment": data.get("sentiment", "neutral"),
+            "is_toxic": data.get("is_toxic", "false"),
+        })
+    else:
+        set_result(rid, {
+            "success": False,
+            "error": data.get("error", "processing failed"),
+        })
 
     return jsonify({"status": "ok"}), 200
 
 
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
 def main():
     load_models()
 
     threading.Thread(target=embed_worker, daemon=True).start()
-    threading.Thread(target=callback_worker, daemon=True).start()
+    
+    for i in range(NUM_CALLBACK_WORKERS):
+        threading.Thread(target=callback_worker, args=(i,), daemon=True).start()
+    
+    logger.info(f"Started {NUM_CALLBACK_WORKERS} callback workers")
 
     host, port = NODE_0_IP.split(":")
     app.run(host=host, port=int(port), threaded=True)

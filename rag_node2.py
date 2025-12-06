@@ -7,20 +7,15 @@ from queue import Queue, Empty
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 import requests
-import sqlite3
 import torch
 
 from flask import Flask, request, jsonify
 from transformers import (
     AutoTokenizer,
-    AutoModelForSequenceClassification,
     AutoModelForCausalLM,
     pipeline as hf_pipeline,
 )
 
-# ------------------------------------------------------------
-# LOGGING
-# ------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -28,49 +23,29 @@ logger = logging.getLogger("Node2")
 
 app = Flask(__name__)
 
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
 NODE_0_IP = os.environ.get("NODE_0_IP", "localhost:8000")
 NODE_2_IP = os.environ.get("NODE_2_IP", "localhost:8002")
-
-DOCUMENTS_DB = os.environ.get("DOCUMENTS_DB", "documents/documents.db")
 
 BATCH_SIZE = 8
 BATCH_TIMEOUT = 0.05
 
+NUM_CALLBACK_WORKERS = 2
+
 MAX_QUEUE_SIZE = 2000
 
-# ------------------------------------------------------------
-# GLOBAL STATE
-# ------------------------------------------------------------
 callback_queue = Queue(maxsize=MAX_QUEUE_SIZE)
 
-# Models
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE_INT = 0 if torch.cuda.is_available() else -1
 
-reranker_model = None
-reranker_tok = None
 llm_model = None
 llm_tok = None
 sent_pipe = None
 safe_pipe = None
 
 
-# ------------------------------------------------------------
-# LOAD MODELS
-# ------------------------------------------------------------
 def load_models():
-    global reranker_tok, reranker_model, llm_tok, llm_model, sent_pipe, safe_pipe
-
-    logger.info("Loading reranker...")
-    reranker_tok = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
-    reranker_model = (
-        AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
-        .to(DEVICE)
-        .eval()
-    )
+    global llm_tok, llm_model, sent_pipe, safe_pipe
 
     logger.info("Loading LLM...")
     llm_tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
@@ -102,46 +77,6 @@ def load_models():
     )
 
     logger.info("All models loaded on Node2.")
-
-
-# ------------------------------------------------------------
-# FETCH DOCUMENTS
-# ------------------------------------------------------------
-def fetch_docs(doc_ids: List[int]):
-    db = DOCUMENTS_DB
-    if not os.path.exists(db):
-        return []
-
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    placeholders = ",".join("?" for _ in doc_ids)
-    q = f"SELECT doc_id, title, content FROM documents WHERE doc_id IN ({placeholders})"
-    cur.execute(q, doc_ids)
-
-    out = {row["doc_id"]: dict(row) for row in cur.fetchall()}
-    conn.close()
-
-    return [out[i] for i in doc_ids if i in out]
-
-
-# ------------------------------------------------------------
-# RERANK
-# ------------------------------------------------------------
-def rerank(query: str, docs: List[Dict]):
-    if not docs:
-        return []
-
-    pairs = [[query, d["content"]] for d in docs]
-    with torch.no_grad():
-        tok = reranker_tok(
-            pairs, truncation=True, padding=True, return_tensors="pt"
-        ).to(DEVICE)
-        logits = reranker_model(**tok).logits.squeeze(-1).cpu().numpy()
-
-    scored = sorted(zip(docs, logits.tolist()), key=lambda x: x[1], reverse=True)
-    return [d for d, _ in scored]
 
 
 def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List[str]:
@@ -184,12 +119,11 @@ def llm_generate_batch(queries: List[str], docs_batch: List[List[Dict]]) -> List
     return answers
 
 
-
-def callback_worker():
-    logger.info("Node2 callback_worker (BATCH MODE with true batch LLM) started.")
+def callback_worker(worker_id: int):
+    logger.info(f"Node2 callback_worker-{worker_id} started.")
 
     node0_callback_url = f"http://{NODE_0_IP}/final_callback"
-    logger.info(f"Node2 will callback Node0 at: {node0_callback_url}")
+    logger.info(f"Node2-Worker{worker_id} will callback Node0 at: {node0_callback_url}")
 
     while True:
         batch = []
@@ -215,41 +149,17 @@ def callback_worker():
                     break
 
             batch_size = len(batch)
-            logger.info(f"[Node2] Callback batch size = {batch_size}")
+            logger.info(f"[Node2-Worker{worker_id}] Callback batch size = {batch_size}")
 
             request_ids = [b["request_id"] for b in batch]
             queries = [b["query"] for b in batch]
-            doc_ids_batch = []
-
-            for item in batch:
-                doc_ids_batch.append(item["doc_ids"][0] if item["doc_ids"] else [])
-
-            t_fetch = time.time()
-            all_docs_batch = []
-            for doc_ids in doc_ids_batch:
-                all_docs_batch.append(fetch_docs(doc_ids))
-            logger.info(
-                "[Node2] Fetch docs batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_fetch,
-            )
-
-            t_rerank = time.time()
-            reranked_batch = []
-            for q, docs in zip(queries, all_docs_batch):
-                reranked_batch.append(rerank(q, docs))
-            logger.info(
-                "[Node2] Rerank batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_rerank,
-            )
+            docs_batch = [b["docs"] for b in batch]
 
             t_llm = time.time()
-            answers = llm_generate_batch(queries, reranked_batch)
+            answers = llm_generate_batch(queries, docs_batch)
             logger.info(
-                "[Node2] LLM (true batch) batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_llm,
+                "[Node2-Worker%d] LLM (true batch) batch_size=%d time=%.3fs",
+                worker_id, batch_size, time.time() - t_llm,
             )
 
             t_analysis = time.time()
@@ -267,9 +177,8 @@ def callback_worker():
                 sent_raw = sentiment_future.result()
                 safe_raw = safety_future.result()
             logger.info(
-                "[Node2] Analysis batch_size=%d time=%.3fs",
-                batch_size,
-                time.time() - t_analysis,
+                "[Node2-Worker%d] Analysis batch_size=%d time=%.3fs",
+                worker_id, batch_size, time.time() - t_analysis,
             )
 
             sent_map = {
@@ -284,9 +193,8 @@ def callback_worker():
             toxics = ["true" if x["score"] > 0.5 else "false" for x in safe_raw]
 
             logger.info(
-                "[Node2] Callback batch size=%d complete total_time=%.3fs",
-                batch_size,
-                time.time() - start_t,
+                "[Node2-Worker%d] Callback batch complete total_time=%.3fs",
+                worker_id, time.time() - start_t,
             )
 
             def send_callback(rid, ans, s, tox):
@@ -300,10 +208,11 @@ def callback_worker():
                 try:
                     resp = requests.post(node0_callback_url, json=payload, timeout=10)
                     logger.info(
-                        f"[Node2] Callback to Node0 for {rid} status={resp.status_code}"
+                        f"[Node2-Worker{worker_id}] Callback to Node0 for {rid} status={resp.status_code}"
                     )
                 except Exception as e:
-                    logger.error(f"[Node2] Callback Node0 failed for {rid}: {e}")
+                    logger.error(f"[Node2-Worker{worker_id}] Callback Node0 failed for {rid}: {e}")
+
             with ThreadPoolExecutor(max_workers=16) as executor:
                 futures = [
                     executor.submit(send_callback, rid, ans, s, tox)
@@ -313,7 +222,7 @@ def callback_worker():
                     f.result()
 
         except Exception as e:
-            logger.error(f"callback_worker batch error: {e}")
+            logger.error(f"callback_worker-{worker_id} batch error: {e}")
             for item in batch:
                 try:
                     payload = {
@@ -330,9 +239,6 @@ def callback_worker():
                 callback_queue.task_done()
 
 
-# ------------------------------------------------------------
-# ROUTES
-# ------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "healthy", "node": 2}), 200
@@ -343,7 +249,7 @@ def retrieval_callback():
     data = request.json or {}
     rid = data.get("request_id")
     success = data.get("success")
-    doc_ids = data.get("doc_ids", [])
+    docs = data.get("docs", [])
     query = data.get("query", "")
 
     if not rid:
@@ -362,24 +268,22 @@ def retrieval_callback():
             logger.error(f"Failed to notify Node0 of failure for {rid}: {e}")
         return jsonify({"status": "ok"}), 200
 
-    callback_queue.put(
-        {
-            "request_id": rid,
-            "doc_ids": doc_ids,
-            "query": query,
-        }
-    )
+    callback_queue.put({
+        "request_id": rid,
+        "docs": docs,
+        "query": query,
+    })
 
     return jsonify({"status": "queued"}), 200
 
 
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
 def main():
     load_models()
 
-    threading.Thread(target=callback_worker, daemon=True).start()
+    for i in range(NUM_CALLBACK_WORKERS):
+        threading.Thread(target=callback_worker, args=(i,), daemon=True).start()
+    
+    logger.info(f"Started {NUM_CALLBACK_WORKERS} callback workers on Node2")
 
     host, port = NODE_2_IP.split(":")
     logger.info(f"Node2 starting on {host}:{port}")
