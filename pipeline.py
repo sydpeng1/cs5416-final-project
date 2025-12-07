@@ -21,6 +21,7 @@ from flask import Flask, request, jsonify
 from queue import Queue
 import threading
 import requests
+from metrics import MetricsCollector, StepSampler, StepMetrics, NodeMonitor
 
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
@@ -55,6 +56,15 @@ app = Flask(__name__)
 request_queue = Queue()
 results = {}
 results_lock = threading.Lock()
+
+# Metrics (node-specific files)
+metrics = MetricsCollector(
+    enable_metrics=True,
+    metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl",
+    metrics_summary_file_path=f"metrics_summary_node{NODE_NUMBER}.jsonl",
+    immediate_flush=True,
+)
+node_monitor = None
 
 # Node 0's round-robin counter
 request_counter = 0
@@ -172,12 +182,30 @@ class MonolithicPipeline:
 
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries"""
-        model = SentenceTransformer(self.embedding_model_name).to(self.device)
-        embeddings = model.encode(
-            texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )
+        t0 = time.perf_counter()
+        with StepSampler() as s:
+            model = SentenceTransformer(self.embedding_model_name).to(self.device)
+            embeddings = model.encode(
+                texts,
+                normalize_embeddings=True,
+                convert_to_numpy=True
+            )
+        t1 = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="generate_embeddings",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=len(texts),
+                request_ids=[r.request_id for r in []],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+            metrics.flush()
+        except Exception:
+            pass
         del model
         gc.collect()
         return embeddings
@@ -188,9 +216,45 @@ class MonolithicPipeline:
             raise FileNotFoundError("FAISS index not found. Please create the index before running the pipeline.")
 
         print("Loading FAISS index")
-        index = faiss.read_index(CONFIG['faiss_index_path'])
+        t0 = time.perf_counter()
+        with StepSampler() as s_load:
+            index = faiss.read_index(CONFIG['faiss_index_path'])
+        t1 = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="faiss_search.load_index",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=0,
+                request_ids=[],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s_load, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s_load, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+        except Exception:
+            pass
+
         query_embeddings = query_embeddings.astype('float32')
-        _, indices = index.search(query_embeddings, CONFIG['retrieval_k'])
+        t0s = time.perf_counter()
+        with StepSampler() as s_search:
+            _, indices = index.search(query_embeddings, CONFIG['retrieval_k'])
+        t1s = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="faiss_search.search",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=len(query_embeddings) if query_embeddings is not None else 0,
+                request_ids=[],
+                duration_ms=(t1s - t0s) * 1000.0,
+                rss_samples_mb=getattr(s_search, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s_search, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+            metrics.flush()
+        except Exception:
+            pass
         del index
         gc.collect()
         return [row.tolist() for row in indices]
@@ -198,7 +262,9 @@ class MonolithicPipeline:
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite"""
         db_path = f"{CONFIG['documents_path']}/documents.db"
-        conn = sqlite3.connect(db_path)
+        t0 = time.perf_counter()
+        with StepSampler() as s:
+            conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         documents_batch = []
         for doc_ids in doc_id_batches:
@@ -218,13 +284,31 @@ class MonolithicPipeline:
                     })
             documents_batch.append(documents)
         conn.close()
+        t1 = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="fetch_documents",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=len(doc_id_batches),
+                request_ids=[],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+            metrics.flush()
+        except Exception:
+            pass
         return documents_batch
 
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
-        tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_name).to(self.device)
-        model.eval()
+        t0 = time.perf_counter()
+        with StepSampler() as s:
+            tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
+            model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_name).to(self.device)
+            model.eval()
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
             if not documents:
@@ -245,15 +329,33 @@ class MonolithicPipeline:
             reranked_batches.append([doc for doc, _ in doc_scores])
         del model, tokenizer
         gc.collect()
+        t1 = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="rerank_documents",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=len(queries),
+                request_ids=[],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+            metrics.flush()
+        except Exception:
+            pass
         return reranked_batches
 
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
-        model = AutoModelForCausalLM.from_pretrained(
-            self.llm_model_name,
-            dtype=torch.float16,
-        ).to(self.device)
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+        t0 = time.perf_counter()
+        with StepSampler() as s:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.llm_model_name,
+                dtype=torch.float16,
+            ).to(self.device)
+            tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
         responses = []
         for query, documents in zip(queries, documents_batch):
             context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
@@ -282,15 +384,33 @@ class MonolithicPipeline:
             responses.append(response)
         del model, tokenizer
         gc.collect()
+        t1 = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="generate_responses",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=len(queries),
+                request_ids=[],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+            metrics.flush()
+        except Exception:
+            pass
         return responses
 
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response"""
-        classifier = hf_pipeline(
-            "sentiment-analysis",
-            model=self.sentiment_model_name,
-            device=self.device
-        )
+        t0 = time.perf_counter()
+        with StepSampler() as s:
+            classifier = hf_pipeline(
+                "sentiment-analysis",
+                model=self.sentiment_model_name,
+                device=self.device
+            )
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = classifier(truncated_texts)
         sentiment_map = {
@@ -305,15 +425,33 @@ class MonolithicPipeline:
             sentiments.append(sentiment_map.get(result['label'], 'neutral'))
         del classifier
         gc.collect()
+        t1 = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="analyze_sentiment",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=len(texts),
+                request_ids=[],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+            metrics.flush()
+        except Exception:
+            pass
         return sentiments
 
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch"""
-        classifier = hf_pipeline(
-            "text-classification",
-            model=self.safety_model_name,
-            device=self.device
-        )
+        t0 = time.perf_counter()
+        with StepSampler() as s:
+            classifier = hf_pipeline(
+                "text-classification",
+                model=self.safety_model_name,
+                device=self.device
+            )
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = classifier(truncated_texts)
         toxicity_flags = []
@@ -321,6 +459,22 @@ class MonolithicPipeline:
             toxicity_flags.append(result['score'] > 0.5)
         del classifier
         gc.collect()
+        t1 = time.perf_counter()
+        try:
+            m = StepMetrics(
+                step_name="safety_filter",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=len(texts),
+                request_ids=[],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s, 'rss_aggregates', {})
+            )
+            metrics.record_step(m)
+            metrics.flush()
+        except Exception:
+            pass
         return toxicity_flags
 
 
@@ -344,6 +498,26 @@ def process_requests_worker():
                 timestamp=time.time()
             )
 
+            # Record queue wait
+            try:
+                enqueue_ts = request_data.get('timestamp')
+                if enqueue_ts:
+                    wait_ms = (time.time() - enqueue_ts) * 1000.0
+                    m_wait = StepMetrics(
+                        step_name="request_queue_wait",
+                        node_number=NODE_NUMBER,
+                        timestamp=time.time(),
+                        batch_size=1,
+                        request_ids=[req.request_id],
+                        duration_ms=wait_ms,
+                        rss_samples_mb=[],
+                        rss_aggregates={}
+                    )
+                    metrics.record_step(m_wait)
+            except Exception:
+                pass
+            metrics.flush()
+
             # Process request
             response = pipeline.process_request(req)
 
@@ -355,6 +529,23 @@ def process_requests_worker():
                     'sentiment': response.sentiment,
                     'is_toxic': response.is_toxic
                 }
+
+            # Record request_total
+            try:
+                m_total = StepMetrics(
+                    step_name="request_total",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=1,
+                    request_ids=[response.request_id],
+                    duration_ms=(time.time() - req.timestamp) * 1000.0,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                )
+                metrics.record_step(m_total)
+                metrics.flush()
+            except Exception:
+                pass
 
             request_queue.task_done()
         except Exception as e:
@@ -404,7 +595,8 @@ def handle_query():
         # Add to queue (Existing logic)
         request_queue.put({
             'request_id': request_id,
-            'query': query
+            'query': query,
+            'timestamp': time.time(),
         })
 
         # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
@@ -466,6 +658,15 @@ def main():
 
     hostname = current_node_ip.split(':')[0]
     port = int(current_node_ip.split(':')[1]) if ':' in current_node_ip else 8000
+
+    # Start Node monitor and metrics
+    try:
+        global node_monitor
+        node_monitor = NodeMonitor(node_number=NODE_NUMBER, metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl", sample_interval_s=0.02)
+        node_monitor.start()
+        metrics.start()
+    except Exception:
+        pass
 
     # Start Flask server
     print(f"\nStarting Flask server")
