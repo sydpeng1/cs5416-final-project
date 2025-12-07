@@ -5,5 +5,8 @@ datasets
 jinja2
 faiss-cpu
 requests
+memory-profiler
+psutil
+matplotlib
 flask
 sentence_transformers

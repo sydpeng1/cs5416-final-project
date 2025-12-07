@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline as hf_pipeline
+from metrics import MetricsCollector, StepSampler, StepMetrics, NodeMonitor
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,6 +35,15 @@ app = Flask(__name__)
 request_queue = Queue()
 results = {}
 results_lock = threading.Lock()
+
+# Metrics
+metrics = MetricsCollector(
+    enable_metrics=True,
+    metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl",
+    metrics_summary_file_path=f"metrics_summary_node{NODE_NUMBER}.jsonl",
+    immediate_flush=True,
+)
+node_monitor = None
 
 
 @dataclass
@@ -105,15 +115,32 @@ class DistributedPipeline:
         if not batch_requests: return []
 
         start_time = time.time()
+        batch_perf_start = time.perf_counter()
         batch_size = len(batch_requests)
         queries = [req.query for req in batch_requests]
         logger.info(f"--- Processing Batch of {batch_size} Requests ---")
 
         try:
             # --- STEP 1: Embedding (Local) ---
-            t0 = time.time()
-            embeddings = self.embedder.encode(queries, normalize_embeddings=True, convert_to_numpy=True)
-            logger.info(f"[1] Embeddings: {time.time() - t0:.3f}s")
+            t0 = time.perf_counter()
+            with StepSampler() as s_emb:
+                embeddings = self.embedder.encode(queries, normalize_embeddings=True, convert_to_numpy=True)
+            t1 = time.perf_counter()
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="generate_embeddings",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=[r.request_id for r in batch_requests],
+                    duration_ms=(t1 - t0) * 1000.0,
+                    rss_samples_mb=getattr(s_emb, 'rss_samples_mb', []),
+                    rss_aggregates=getattr(s_emb, 'rss_aggregates', {})
+                ))
+                metrics.flush()
+            except Exception:
+                pass
+            logger.info(f"[1] Embeddings: {(t1 - t0):.3f}s")
 
             # --- STEP 2: Retrieval (Node 1) ---
             t0 = time.time()
@@ -136,13 +163,49 @@ class DistributedPipeline:
             logger.info(f"[3] Generation (Node 2): {time.time() - t0:.3f}s")
 
             # --- STEP 4: Analysis (Local) ---
-            t0 = time.time()
+            t0_analysis = time.perf_counter()
             # Truncate for BERT models to prevent errors
             truncated_texts = [t[:TRUNCATE_LENGTH] for t in responses_text]
 
-            # Run Sentiment & Safety in parallel conceptually (sequential here for simplicity)
-            raw_sentiments = self.sentiment_pipe(truncated_texts)
-            raw_safety = self.safety_pipe(truncated_texts)
+            # Run Sentiment
+            t0 = time.perf_counter()
+            with StepSampler() as s_sent:
+                raw_sentiments = self.sentiment_pipe(truncated_texts)
+            t1 = time.perf_counter()
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="analyze_sentiment",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=[r.request_id for r in batch_requests],
+                    duration_ms=(t1 - t0) * 1000.0,
+                    rss_samples_mb=getattr(s_sent, 'rss_samples_mb', []),
+                    rss_aggregates=getattr(s_sent, 'rss_aggregates', {})
+                ))
+                metrics.flush()
+            except Exception:
+                pass
+
+            # Run Safety
+            t0 = time.perf_counter()
+            with StepSampler() as s_safe:
+                raw_safety = self.safety_pipe(truncated_texts)
+            t1 = time.perf_counter()
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="safety_filter",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=[r.request_id for r in batch_requests],
+                    duration_ms=(t1 - t0) * 1000.0,
+                    rss_samples_mb=getattr(s_safe, 'rss_samples_mb', []),
+                    rss_aggregates=getattr(s_safe, 'rss_aggregates', {})
+                ))
+                metrics.flush()
+            except Exception:
+                pass
 
             # Parse Results
             sentiment_map = {
@@ -152,7 +215,7 @@ class DistributedPipeline:
             final_sentiments = [sentiment_map.get(r['label'], 'neutral') for r in raw_sentiments]
             is_toxic_flags = [r['score'] > 0.5 for r in raw_safety]
 
-            logger.info(f"[4] Analysis: {time.time() - t0:.3f}s")
+            logger.info(f"[4] Analysis: {(time.perf_counter() - t0_analysis):.3f}s")
 
             # --- Assemble Responses ---
             pipeline_responses = []
@@ -170,6 +233,20 @@ class DistributedPipeline:
                     processing_time=req_latency
                 ))
 
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="node0_total",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=[r.request_id for r in batch_requests],
+                    duration_ms=(time.perf_counter() - batch_perf_start) * 1000.0,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                ))
+                metrics.flush()
+            except Exception:
+                pass
             logger.info(f"Batch completed in {total_duration:.3f}s")
             return pipeline_responses
 
@@ -195,6 +272,21 @@ def worker_loop():
             first_req = request_queue.get()
             if first_req is None: break  # Shutdown signal
             batch.append(first_req)
+            # Record queue wait for first request
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="request_queue_wait",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=1,
+                    request_ids=[first_req['request_id']],
+                    duration_ms=(time.time() - first_req['timestamp']) * 1000.0,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                ))
+                metrics.flush()
+            except Exception:
+                pass
 
             # 2. Opportunistic Collection
             # Try to grab more items if they are immediately available (up to BATCH_SIZE)
@@ -208,6 +300,21 @@ def worker_loop():
                     # Non-blocking get (or very short timeout)
                     req = request_queue.get(timeout=remaining)
                     batch.append(req)
+                    # Record queue wait for subsequent requests
+                    try:
+                        metrics.record_step(StepMetrics(
+                            step_name="request_queue_wait",
+                            node_number=NODE_NUMBER,
+                            timestamp=time.time(),
+                            batch_size=1,
+                            request_ids=[req['request_id']],
+                            duration_ms=(time.time() - req['timestamp']) * 1000.0,
+                            rss_samples_mb=[],
+                            rss_aggregates={}
+                        ))
+                        metrics.flush()
+                    except Exception:
+                        pass
                 except Empty:
                     break
 
@@ -238,6 +345,23 @@ def run_batch_task(pipeline: DistributedPipeline, batch_reqs: List[PipelineReque
                     'is_toxic': res.is_toxic,
                     'success': True
                 }
+                # Record per-request total latency
+                try:
+                    src_req = next((r for r in batch_reqs if r.request_id == res.request_id), None)
+                    if src_req is not None:
+                        metrics.record_step(StepMetrics(
+                            step_name="request_total",
+                            node_number=NODE_NUMBER,
+                            timestamp=time.time(),
+                            batch_size=1,
+                            request_ids=[res.request_id],
+                            duration_ms=(time.time() - src_req.timestamp) * 1000.0,
+                            rss_samples_mb=[],
+                            rss_aggregates={}
+                        ))
+                        metrics.flush()
+                except Exception:
+                    pass
 
         # Handle total failures (empty response list)
         if not responses:
@@ -317,6 +441,15 @@ def main():
     # Start Server
     hostname = NODE_0_IP_RAW.split(':')[0]
     port = int(NODE_0_IP_RAW.split(':')[1]) if ':' in NODE_0_IP_RAW else 8000
+
+    # Start node monitor & metrics
+    try:
+        global node_monitor
+        node_monitor = NodeMonitor(node_number=NODE_NUMBER, metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl", sample_interval_s=0.02)
+        node_monitor.start()
+        metrics.start()
+    except Exception:
+        pass
 
     logger.info(f"Node 0 Orchestrator listening on {hostname}:{port}")
     app.run(host=hostname, port=port, threaded=True)
