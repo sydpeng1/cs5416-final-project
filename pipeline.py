@@ -20,6 +20,7 @@ from sentence_transformers import SentenceTransformer
 from flask import Flask, request, jsonify
 from queue import Queue
 import threading
+import requests
 
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
@@ -34,10 +35,17 @@ DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 CONFIG = {
     'faiss_index_path': FAISS_INDEX_PATH,
     'documents_path': DOCUMENTS_DIR,
-    'faiss_dim': 768, #You must use this dimension
-    'max_tokens': 128, #You must use this max token limit
-    'retrieval_k': 10, #You must retrieve this many documents from the FAISS index
-    'truncate_length': 512 # You must use this truncate length
+    'faiss_dim': 768,  # You must use this dimension
+    'max_tokens': 128,  # You must use this max token limit
+    'retrieval_k': 10,  # You must retrieve this many documents from the FAISS index
+    'truncate_length': 512  # You must use this truncate length
+}
+
+# Map node numbers to their specific IP variables
+node_ip_map = {
+    0: NODE_0_IP,
+    1: NODE_1_IP,
+    2: NODE_2_IP
 }
 
 # Flask app
@@ -48,11 +56,17 @@ request_queue = Queue()
 results = {}
 results_lock = threading.Lock()
 
+# Node 0's round-robin counter
+request_counter = 0
+request_counter_lock = threading.Lock()
+
+
 @dataclass
 class PipelineRequest:
     request_id: str
     query: str
     timestamp: float
+
 
 @dataclass
 class PipelineResponse:
@@ -62,26 +76,26 @@ class PipelineResponse:
     is_toxic: str
     processing_time: float
 
-class MonolithicPipeline:
 
+class MonolithicPipeline:
     """
     Deliberately inefficient monolithic pipeline
     """
-    
+
     def __init__(self):
         self.device = torch.device('cpu')
         print(f"Initializing pipeline on {self.device}")
         print(f"Node {NODE_NUMBER}/{TOTAL_NODES}")
         print(f"FAISS index path: {CONFIG['faiss_index_path']}")
         print(f"Documents path: {CONFIG['documents_path']}")
-        
+
         # Model names
         self.embedding_model_name = 'BAAI/bge-base-en-v1.5'
         self.reranker_model_name = 'BAAI/bge-reranker-base'
         self.llm_model_name = 'Qwen/Qwen2.5-0.5B-Instruct'
         self.sentiment_model_name = 'nlptown/bert-base-multilingual-uncased-sentiment'
         self.safety_model_name = 'unitary/toxic-bert'
-    
+
     def process_request(self, request: PipelineRequest) -> PipelineResponse:
         """
         Backwards-compatible single-request entry point that delegates
@@ -101,12 +115,12 @@ class MonolithicPipeline:
         start_times = [time.time() for _ in requests]
         queries = [req.query for req in requests]
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print(f"Processing batch of {batch_size} requests")
-        print("="*60)
+        print("=" * 60)
         for request in requests:
             print(f"- {request.request_id}: {request.query[:50]}...")
-        
+
         # Step 1: Generate embeddings
         print("\n[Step 1/7] Generating embeddings for batch...")
         query_embeddings = self._generate_embeddings_batch(queries)
@@ -140,7 +154,7 @@ class MonolithicPipeline:
         # Step 7: Safety filter on responses
         print("\n[Step 7/7] Applying safety filter to batch...")
         toxicity_flags = self._filter_response_safety_batch(responses_text)
-        
+
         responses = []
         for idx, request in enumerate(requests):
             processing_time = time.time() - start_times[idx]
@@ -153,9 +167,9 @@ class MonolithicPipeline:
                 is_toxic=sensitivity_result,
                 processing_time=processing_time
             ))
-        
+
         return responses
-    
+
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries"""
         model = SentenceTransformer(self.embedding_model_name).to(self.device)
@@ -167,12 +181,12 @@ class MonolithicPipeline:
         del model
         gc.collect()
         return embeddings
-    
+
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings"""
         if not os.path.exists(CONFIG['faiss_index_path']):
             raise FileNotFoundError("FAISS index not found. Please create the index before running the pipeline.")
-        
+
         print("Loading FAISS index")
         index = faiss.read_index(CONFIG['faiss_index_path'])
         query_embeddings = query_embeddings.astype('float32')
@@ -180,7 +194,7 @@ class MonolithicPipeline:
         del index
         gc.collect()
         return [row.tolist() for row in indices]
-    
+
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite"""
         db_path = f"{CONFIG['documents_path']}/documents.db"
@@ -205,7 +219,7 @@ class MonolithicPipeline:
             documents_batch.append(documents)
         conn.close()
         return documents_batch
-    
+
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
         tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
@@ -232,7 +246,7 @@ class MonolithicPipeline:
         del model, tokenizer
         gc.collect()
         return reranked_batches
-    
+
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
         model = AutoModelForCausalLM.from_pretrained(
@@ -269,7 +283,7 @@ class MonolithicPipeline:
         del model, tokenizer
         gc.collect()
         return responses
-    
+
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response"""
         classifier = hf_pipeline(
@@ -292,7 +306,7 @@ class MonolithicPipeline:
         del classifier
         gc.collect()
         return sentiments
-    
+
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch"""
         classifier = hf_pipeline(
@@ -313,6 +327,7 @@ class MonolithicPipeline:
 # Global pipeline instance
 pipeline = None
 
+
 def process_requests_worker():
     """Worker thread that processes requests from the queue"""
     global pipeline
@@ -321,17 +336,17 @@ def process_requests_worker():
             request_data = request_queue.get()
             if request_data is None:  # Shutdown signal
                 break
-            
+
             # Create request object
             req = PipelineRequest(
                 request_id=request_data['request_id'],
                 query=request_data['query'],
                 timestamp=time.time()
             )
-            
+
             # Process request
             response = pipeline.process_request(req)
-            
+
             # Store result
             with results_lock:
                 results[request_data['request_id']] = {
@@ -340,7 +355,7 @@ def process_requests_worker():
                     'sentiment': response.sentiment,
                     'is_toxic': response.is_toxic
                 }
-            
+
             request_queue.task_done()
         except Exception as e:
             print(f"Error processing request: {e}")
@@ -349,22 +364,44 @@ def process_requests_worker():
 
 @app.route('/query', methods=['POST'])
 def handle_query():
+    global request_counter
+
     """Handle incoming query requests"""
     try:
         data = request.json
         request_id = data.get('request_id')
         query = data.get('query')
-        
+
         if not request_id or not query:
             return jsonify({'error': 'Missing request_id or query'}), 400
-        
+
+        # node 0 should assign requests in round-robin manner
+        if NODE_NUMBER == 0:
+            with request_counter_lock:
+                target_node = request_counter % TOTAL_NODES
+                request_counter += 1
+
+            if target_node != 0:
+                target_ip = NODE_1_IP if target_node == 1 else NODE_2_IP
+                target_url = f"http://{target_ip}/query"
+
+                print(f"Node 0 forwarding request {request_id} to Node {target_node} ({target_url})")
+
+                try:
+                    response = requests.post(target_url, json=data, timeout=300)
+                    return jsonify(response.json()), response.status_code
+                except Exception as e:
+                    print(f"Failed to forward to Node {target_node}: {e}... Falling back to Node 0")
+                    pass
+
         # Check if result already exists (request already processed)
         with results_lock:
             if request_id in results:
                 return jsonify(results[request_id]), 200
-        
-        print(f"queueing request {request_id}")
-        # Add to queue
+
+        print(f"Node {NODE_NUMBER} queueing request {request_id}")
+
+        # Add to queue (Existing logic)
         request_queue.put({
             'request_id': request_id,
             'query': query
@@ -378,12 +415,12 @@ def handle_query():
                 if request_id in results:
                     result = results.pop(request_id)
                     return jsonify(result), 200
-            
+
             if time.time() - start_wait > timeout:
                 return jsonify({'error': 'Request timeout'}), 504
-            
+
             time.sleep(0.1)
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -403,29 +440,35 @@ def main():
     Main execution function
     """
     global pipeline
-    
-    print("="*60)
+
+    print("=" * 60)
     print("MONOLITHIC CUSTOMER SUPPORT PIPELINE")
-    print("="*60)
+    print("=" * 60)
     print(f"\nRunning on Node {NODE_NUMBER} of {TOTAL_NODES} nodes")
     print(f"Node IPs: 0={NODE_0_IP}, 1={NODE_1_IP}, 2={NODE_2_IP}")
     print("\nNOTE: This implementation is deliberately inefficient.")
     print("Your task is to optimize this for a 3-node cluster.\n")
-    
+
     # Initialize pipeline
     print("Initializing pipeline...")
     pipeline = MonolithicPipeline()
     print("Pipeline initialized!")
-    
+
     # Start worker thread
     worker_thread = threading.Thread(target=process_requests_worker, daemon=True)
     worker_thread.start()
     print("Worker thread started!")
-    
+
+    # Get the IP for THIS specific node (default to Node 0 if undefined)
+    current_node_ip = node_ip_map.get(NODE_NUMBER, NODE_0_IP)
+
+    print(f"Binding to {current_node_ip} for Node {NODE_NUMBER}")
+
+    hostname = current_node_ip.split(':')[0]
+    port = int(current_node_ip.split(':')[1]) if ':' in current_node_ip else 8000
+
     # Start Flask server
     print(f"\nStarting Flask server")
-    hostname = NODE_0_IP.split(':')[0]
-    port = int(NODE_0_IP.split(':')[1]) if ':' in NODE_0_IP else 8000
     app.run(host=hostname, port=port, threaded=True)
 
 
