@@ -278,10 +278,10 @@ class NodeMonitor:
         self._buffer: List[Dict[str, Any]] = []
         # Prepare process handle
         self._proc = _psutil_proc
-        # Prime cpu_percent for immediate differential readings
+        # Prime cpu_percent for differential readings (Linux may require a first interval)
         try:
             if self._proc is not None:
-                self._proc.cpu_percent(interval=None)
+                self._proc.cpu_percent(interval=0.0)
         except Exception:
             pass
 
@@ -316,10 +316,10 @@ class NodeMonitor:
             ts = time.time()
             cpu_pct = None
             rss_mb = None
-            # CPU percent via psutil
+            # CPU percent via psutil (use a short interval on Linux to avoid 0%)
             try:
                 if self._proc is not None:
-                    cpu_pct = float(self._proc.cpu_percent(interval=None))
+                    cpu_pct = float(self._proc.cpu_percent(interval=max(self.sample_interval_s, 0.02)))
             except Exception:
                 cpu_pct = None
             # RSS via psutil/resource fallback
