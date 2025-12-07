@@ -25,46 +25,46 @@
 
 # 1. Pipeline Depth
 # Keep pipeline full (2 Active Compute + 2 Network Wait)
-export MAX_WORKERS=4
+# export MAX_WORKERS=4
 
-# 2. CPU Threading (The Critical Fix)
-# Limit PyTorch to 3 cores per task.
-# Since Node 0 runs ~2 tasks locally at once, 2 * 3 = 6 Cores. Perfect fit.
-export OMP_NUM_THREADS=3
+# # 2. CPU Threading (The Critical Fix)
+# # Limit PyTorch to 3 cores per task.
+# # Since Node 0 runs ~2 tasks locally at once, 2 * 3 = 6 Cores. Perfect fit.
+# export OMP_NUM_THREADS=3
 
-# 3. Batching
-export BATCH_SIZE=8
-export BATCH_TIMEOUT=0.1
-# CPU vectorization is poor. Serial processing (1 at a time) is often faster/safer.
-# If you had a T4 GPU, you would set this to 4 or 8.
-export GPU_MICRO_BATCH_SIZE=1
+# # 3. Batching
+# export BATCH_SIZE=8
+# export BATCH_TIMEOUT=0.1
+# # CPU vectorization is poor. Serial processing (1 at a time) is often faster/safer.
+# # If you had a T4 GPU, you would set this to 4 or 8.
+# export GPU_MICRO_BATCH_SIZE=1
 
 
 # --- CASE 3: REMOTE LINUX (TESLA T4 GPU) CONFIG ---
 # Resource Strategy: High concurrency, Parallel processing (GPU loves batches)
 
-#export BATCH_SIZE=32           # Large batches to minimize HTTP overhead
-#export BATCH_TIMEOUT=0.1
-#export MAX_WORKERS=4           # Maximize pipeline depth
-#
-## CPU is just a manager here (Kernel launch + Network).
-## 4 threads is plenty safe.
-#export OMP_NUM_THREADS=4
-#
-#export GPU_MICRO_BATCH_SIZE=4  # T4 optimization: Process 4 items in parallel on VRAM
+export BATCH_SIZE=32           # Large batches to minimize HTTP overhead
+export BATCH_TIMEOUT=0.1
+export MAX_WORKERS=4           # Maximize pipeline depth
+
+# CPU is just a manager here (Kernel launch + Network).
+# 4 threads is plenty safe.
+export OMP_NUM_THREADS=4
+
+export GPU_MICRO_BATCH_SIZE=4  # T4 optimization: Process 4 items in parallel on VRAM
 # =================================================================
 
 if [ "$NODE_NUMBER" -eq 0 ]; then
     echo "Starting Node $NODE_NUMBER..."
-    exec python3 pipeline.py
+    exec python pipeline.py
 
 elif [ "$NODE_NUMBER" -eq 1 ]; then
     echo "Starting Node $NODE_NUMBER..."
-    exec python3 node1_retrieval.py
+    exec python node1_retrieval.py
 
 elif [ "$NODE_NUMBER" -eq 2 ]; then
     echo "Starting Node $NODE_NUMBER..."
-    exec python3 node2_inference.py
+    exec python node2_inference.py
 
 else
     echo "Error: Invalid NODE_NUMBER ($NODE_NUMBER). Must be 0, 1, or 2."
