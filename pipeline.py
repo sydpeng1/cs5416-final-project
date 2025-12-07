@@ -16,6 +16,7 @@ from sentence_transformers import SentenceTransformer
 from dataclasses import dataclass
 from typing import List
 from inference_engine import InferenceWorker
+from metrics import MetricsCollector, StepSampler, StepMetrics, NodeMonitor
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -41,6 +42,14 @@ app = Flask(__name__)
 request_queue = Queue()
 results = {}
 results_lock = threading.Lock()
+
+# Metrics
+metrics = MetricsCollector(
+    enable_metrics=True,
+    metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl",
+    metrics_summary_file_path=f"metrics_summary_node{NODE_NUMBER}.jsonl",
+    immediate_flush=True,
+)
 
 # Load Balance Counter
 batch_counter = 0
@@ -118,14 +127,35 @@ class DistributedPipeline:
 
         try:
             # [1] Embed (Always Local)
-            t0 = time.time()
-            embeddings = self.embedder.encode(queries, normalize_embeddings=True, convert_to_numpy=True)
-            logger.info(f"[1] Embeddings: {time.time() - t0:.3f}s")
+            t0 = time.perf_counter()
+            with StepSampler() as s:
+                embeddings = self.embedder.encode(queries, normalize_embeddings=True, convert_to_numpy=True)
+            t1 = time.perf_counter()
+            duration_ms = (t1 - t0) * 1000.0
+            try:
+                m = StepMetrics(
+                    step_name="generate_embeddings",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=[r.request_id for r in batch_requests],
+                    duration_ms=duration_ms,
+                    rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                    rss_aggregates=getattr(s, 'rss_aggregates', {})
+                )
+                metrics.record_step(m)
+                metrics.flush()
+            except Exception:
+                pass
+            logger.info(f"[1] Embeddings: {(t1 - t0):.3f}s")
 
             # [2] Retrieve (Always Remote Node 1)
             t0 = time.time()
             # Convert numpy to list for JSON serialization
-            payload_n1 = {'embeddings': embeddings.tolist()}
+            payload_n1 = {
+                'embeddings': embeddings.tolist(),
+                'request_ids': [r.request_id for r in batch_requests],
+            }
             resp_n1 = requests.post(self.retrieval_url, json=payload_n1, timeout=30)
             resp_n1.raise_for_status()
             doc_ids_batch = resp_n1.json()['doc_ids']
@@ -141,8 +171,11 @@ class DistributedPipeline:
                 logger.info(f"Local Generation + Analysis: {time.time() - t0:.3f}s")
             else:
                 logger.info(f"[Batch {batch_counter_value}] Routing REMOTELY (Node 2)")
-
-                payload_n2 = {'queries': queries, 'doc_ids': doc_ids_batch}
+                payload_n2 = {
+                    'queries': queries,
+                    'doc_ids': doc_ids_batch,
+                    'request_ids': [r.request_id for r in batch_requests],
+                }
                 resp_n2 = requests.post(self.inference_url, json=payload_n2, timeout=300)
                 resp_n2.raise_for_status()
                 results_data = resp_n2.json()['results']
@@ -162,6 +195,23 @@ class DistributedPipeline:
                     processing_time=time.time() - req.timestamp
                 ))
 
+            # Record node0_total for the batch
+            try:
+                m_total = StepMetrics(
+                    step_name="node0_total",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=[r.request_id for r in batch_requests],
+                    duration_ms=total_duration * 1000.0,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                )
+                metrics.record_step(m_total)
+                metrics.flush()
+            except Exception:
+                pass
+
             logger.info(f"Batch completed in {total_duration:.3f}s")
             return pipeline_responses
 
@@ -176,6 +226,26 @@ pipeline_instance = None
 def run_batch_task(pipeline: DistributedPipeline, batch_reqs: List[PipelineRequest]):
     """Helper to run processing in a separate thread and save results."""
     try:
+        # Record queue wait per request (time since enqueue to start of processing)
+        now = time.time()
+        for r in batch_reqs:
+            try:
+                wait_ms = (now - r.timestamp) * 1000.0
+                m_wait = StepMetrics(
+                    step_name="request_queue_wait",
+                    node_number=NODE_NUMBER,
+                    timestamp=now,
+                    batch_size=1,
+                    request_ids=[r.request_id],
+                    duration_ms=wait_ms,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                )
+                metrics.record_step(m_wait)
+            except Exception:
+                pass
+        metrics.flush()
+
         # This blocks THIS thread, but not the main worker loop
         responses = pipeline.process_batch(batch_reqs)
 
@@ -204,6 +274,26 @@ def run_batch_task(pipeline: DistributedPipeline, batch_reqs: List[PipelineReque
                 if r.request_id not in results:
                     results[r.request_id] = {'error': str(e), 'success': False}
     finally:
+        # Record request_total per request if available in results
+        try:
+            with results_lock:
+                for r in batch_reqs:
+                    if r.request_id in results and results[r.request_id].get('success'):
+                        duration_ms = (time.time() - r.timestamp) * 1000.0
+                        m_total = StepMetrics(
+                            step_name="request_total",
+                            node_number=NODE_NUMBER,
+                            timestamp=time.time(),
+                            batch_size=1,
+                            request_ids=[r.request_id],
+                            duration_ms=duration_ms,
+                            rss_samples_mb=[],
+                            rss_aggregates={}
+                        )
+                        metrics.record_step(m_total)
+            metrics.flush()
+        except Exception:
+            pass
         for _ in batch_reqs:
             request_queue.task_done()
 
@@ -301,6 +391,17 @@ def main():
 
     # Initialize Pipeline (Loads local models)
     pipeline_instance = DistributedPipeline()
+
+    # Start Node-level monitoring and metrics writer
+    try:
+        node_monitor = NodeMonitor(node_number=NODE_NUMBER, metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl", sample_interval_s=0.02)
+        node_monitor.start()
+    except Exception:
+        pass
+    try:
+        metrics.start()
+    except Exception:
+        pass
 
     # Start Worker Thread
     t = threading.Thread(target=worker_loop, daemon=True)
