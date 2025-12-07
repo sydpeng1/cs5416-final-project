@@ -11,6 +11,7 @@
 # --- CASE 1: LOCAL MAC (M2 Max) CONFIG ---
 # Resource Strategy: Conservative concurrency, High vectorization (MPS loves batches)
 
+#export ONLY_CPU="true"
 #export BATCH_SIZE=16           # Moderate batch size for responsiveness
 #export BATCH_TIMEOUT=0.1
 #export MAX_WORKERS=2           # Limit concurrency: 1 Local Task + 1 Remote Task.
@@ -22,6 +23,7 @@
 
 # --- CASE 2: REMOTE LINUX (CPU ONLY) CONFIG ---
 # Resource Strategy: High concurrency, Serial processing (CPU hates batches)
+export ONLY_CPU="true"
 
 # 1. Pipeline Depth
 # Keep pipeline full (2 Active Compute + 2 Network Wait)
@@ -43,6 +45,7 @@ export GPU_MICRO_BATCH_SIZE=1
 # --- CASE 3: REMOTE LINUX (TESLA T4 GPU) CONFIG ---
 # Resource Strategy: High concurrency, Parallel processing (GPU loves batches)
 
+#export ONLY_CPU="false"
 #export BATCH_SIZE=32           # Large batches to minimize HTTP overhead
 #export BATCH_TIMEOUT=0.1
 #export MAX_WORKERS=4           # Maximize pipeline depth
@@ -60,6 +63,7 @@ if [ "$NODE_NUMBER" -eq 0 ]; then
 
 elif [ "$NODE_NUMBER" -eq 1 ]; then
     echo "Starting Node $NODE_NUMBER..."
+    export OMP_NUM_THREADS=6
     exec python3 node1_retrieval.py
 
 elif [ "$NODE_NUMBER" -eq 2 ]; then

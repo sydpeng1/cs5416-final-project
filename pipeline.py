@@ -65,18 +65,20 @@ class PipelineResponse:
 
 class DistributedPipeline:
     def __init__(self):
-        if torch.cuda.is_available():
-            self.device = torch.device('cuda')
+        only_cpu = os.environ.get("ONLY_CPU", "true").lower() == "true"
+
+        if only_cpu:
+            logger.info("Config: ONLY_CPU=true detected. Forcing CPU mode.")
+            self.device_str = "cpu"
+        elif torch.cuda.is_available():
             self.device_str = "cuda"
         elif torch.backends.mps.is_available():
-            self.device = torch.device('mps')
             self.device_str = "mps"
         else:
-            self.device = torch.device('cpu')
             self.device_str = "cpu"
 
         logger.info(f"Initializing Distributed Pipeline on Node {NODE_NUMBER}")
-        logger.info(f"Compute Device: {self.device_str} (ID: {self.device})")
+        logger.info(f"Compute Device: {self.device_str}")
 
         # Service URLs
         n1_host = NODE_1_IP_RAW.split(':')[0]

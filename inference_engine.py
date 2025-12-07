@@ -24,8 +24,14 @@ class InferenceWorker:
     def __init__(self, micro_batch_size=4):
         self.micro_batch_size = micro_batch_size
 
+        only_cpu = os.environ.get("ONLY_CPU", "false").lower() == "true"
+
         # Hardware Detection
-        if torch.cuda.is_available():
+        if only_cpu:
+            logger.info("Config: ONLY_CPU=true detected. Forcing CPU mode.")
+            self.device = torch.device('cpu')
+            self.dtype = torch.float32
+        elif torch.cuda.is_available():
             self.device = torch.device('cuda')
             self.dtype = torch.float16
         elif torch.backends.mps.is_available():
