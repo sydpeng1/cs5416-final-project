@@ -18,6 +18,7 @@ from transformers import (
     AutoModelForCausalLM,
     pipeline as hf_pipeline,
 )
+from metrics import MetricsCollector, StepSampler, StepMetrics, NodeMonitor
 
 # ------------------------------------------------------------
 # LOGGING
@@ -74,6 +75,15 @@ llm_tok = None
 sent_pipe = None
 safe_pipe = None
 
+# Metrics
+metrics = MetricsCollector(
+    enable_metrics=True,
+    metrics_file_path=f"metrics_node0.jsonl",
+    metrics_summary_file_path=f"metrics_summary_node0.jsonl",
+    immediate_flush=True,
+)
+node_monitor = None
+
 
 # ------------------------------------------------------------
 # ROUND ROBIN
@@ -100,42 +110,110 @@ def load_models():
         safe_pipe
 
     logger.info("Loading embedding model...")
-    embedder = SentenceTransformer(
-        "BAAI/bge-base-en-v1.5", device=("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    t0 = time.perf_counter()
+    with StepSampler() as s_emb_load:
+        embedder = SentenceTransformer(
+            "BAAI/bge-base-en-v1.5", device=("cuda" if torch.cuda.is_available() else "cpu")
+        )
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="generate_embeddings.load_model",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=0,
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s_emb_load, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s_emb_load, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
 
     logger.info("Loading reranker...")
-    reranker_tok = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
-    reranker_model = (
-        AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
-        .to(DEVICE)
-        .eval()
-    )
+    t0 = time.perf_counter()
+    with StepSampler() as s_rerank_load:
+        reranker_tok = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
+        reranker_model = (
+            AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
+            .to(DEVICE)
+            .eval()
+        )
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="rerank.load_model",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=0,
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s_rerank_load, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s_rerank_load, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
 
     logger.info("Loading LLM...")
     llm_tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
     dtype = torch.float16 if DEVICE.type == "cuda" else torch.float32
-    llm_model = (
-        AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen2.5-0.5B-Instruct",
-            dtype=dtype,
-            use_cache=True,
+    t0 = time.perf_counter()
+    with StepSampler() as s_llm_load:
+        llm_model = (
+            AutoModelForCausalLM.from_pretrained(
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                dtype=dtype,
+                use_cache=True,
+            )
+            .to(DEVICE)
+            .eval()
         )
-        .to(DEVICE)
-        .eval()
-    )
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="generate_responses.load_model",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=0,
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s_llm_load, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s_llm_load, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
 
     logger.info("Loading sentiment & safety...")
-    sent_pipe = hf_pipeline(
-        "sentiment-analysis",
-        model="nlptown/bert-base-multilingual-uncased-sentiment",
-        device=DEVICE_INT,
-    )
-    safe_pipe = hf_pipeline(
-        "text-classification",
-        model="unitary/toxic-bert",
-        device=DEVICE_INT,
-    )
+    t0 = time.perf_counter()
+    with StepSampler() as s_analysis_load:
+        sent_pipe = hf_pipeline(
+            "sentiment-analysis",
+            model="nlptown/bert-base-multilingual-uncased-sentiment",
+            device=DEVICE_INT,
+        )
+        safe_pipe = hf_pipeline(
+            "text-classification",
+            model="unitary/toxic-bert",
+            device=DEVICE_INT,
+        )
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="analysis.load_model",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=0,
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s_analysis_load, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s_analysis_load, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
 
     logger.info("All models loaded.")
 
@@ -148,9 +226,11 @@ def fetch_docs(doc_ids: List[int]):
     if not os.path.exists(db):
         return []
 
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    t0 = time.perf_counter()
+    with StepSampler() as s:
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
 
     placeholders = ",".join("?" for _ in doc_ids)
     q = f"SELECT doc_id, title, content FROM documents WHERE doc_id IN ({placeholders})"
@@ -158,7 +238,21 @@ def fetch_docs(doc_ids: List[int]):
 
     out = {row["doc_id"]: dict(row) for row in cur.fetchall()}
     conn.close()
-
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="fetch_documents",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=len(doc_ids),
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
     return [out[i] for i in doc_ids if i in out]
 
 
@@ -169,14 +263,31 @@ def rerank(query: str, docs: List[Dict]):
     if not docs:
         return []
 
-    pairs = [[query, d["content"]] for d in docs]
-    with torch.no_grad():
-        tok = reranker_tok(
-            pairs, truncation=True, padding=True, return_tensors="pt"
-        ).to(DEVICE)
-        logits = reranker_model(**tok).logits.squeeze(-1).cpu().numpy()
+    t0 = time.perf_counter()
+    with StepSampler() as s:
+        pairs = [[query, d["content"]] for d in docs]
+        with torch.no_grad():
+            tok = reranker_tok(
+                pairs, truncation=True, padding=True, return_tensors="pt"
+            ).to(DEVICE)
+            logits = reranker_model(**tok).logits.squeeze(-1).cpu().numpy()
 
     scored = sorted(zip(docs, logits.tolist()), key=lambda x: x[1], reverse=True)
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="rerank_documents",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=len(docs),
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
     return [d for d, _ in scored]
 
 
@@ -199,15 +310,32 @@ def llm_generate(query: str, docs: List[Dict]):
         DEVICE
     )
 
-    with torch.no_grad():
-        ids = llm_model.generate(
-            **inputs,
-            max_new_tokens=128,
-            temperature=0.01,
-            pad_token_id=llm_tok.eos_token_id,
-        )
+    t0 = time.perf_counter()
+    with StepSampler() as s:
+        with torch.no_grad():
+            ids = llm_model.generate(
+                **inputs,
+                max_new_tokens=128,
+                temperature=0.01,
+                pad_token_id=llm_tok.eos_token_id,
+            )
 
     new_ids = ids[:, inputs.input_ids.shape[1] :]
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="generate_responses",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=1,
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
     return llm_tok.batch_decode(new_ids, skip_special_tokens=True)[0]
 
 
@@ -215,8 +343,43 @@ def llm_generate(query: str, docs: List[Dict]):
 # ANALYSIS
 # ------------------------------------------------------------
 def analyze(text: str):
-    sent = sent_pipe(text[:512])[0]
-    safe = safe_pipe(text[:512])[0]
+    t0 = time.perf_counter()
+    with StepSampler() as s_sent:
+        sent = sent_pipe(text[:512])[0]
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="analyze_sentiment",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=1,
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s_sent, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s_sent, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
+
+    t0 = time.perf_counter()
+    with StepSampler() as s_safe:
+        safe = safe_pipe(text[:512])[0]
+    t1 = time.perf_counter()
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="safety_filter",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=1,
+            request_ids=[],
+            duration_ms=(t1 - t0) * 1000.0,
+            rss_samples_mb=getattr(s_safe, 'rss_samples_mb', []),
+            rss_aggregates=getattr(s_safe, 'rss_aggregates', {})
+        ))
+        metrics.flush()
+    except Exception:
+        pass
 
     star_to_sent = {
         "1 star": "very negative",
@@ -245,6 +408,21 @@ def embed_worker():
             if first is None:
                 break
             batch.append(first)
+            # queue wait
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="request_queue_wait",
+                    node_number=0,
+                    timestamp=time.time(),
+                    batch_size=1,
+                    request_ids=[first["request_id"]],
+                    duration_ms=(time.time() - time.time()) * 0.0,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                ))
+                metrics.flush()
+            except Exception:
+                pass
 
             start = time.time()
             while len(batch) < EMBED_BATCH_SIZE:
@@ -262,15 +440,30 @@ def embed_worker():
             queries = [b["query"] for b in batch]
             req_ids = [b["request_id"] for b in batch]
 
-            t0 = time.time()
-            embs = embedder.encode(
-                queries, normalize_embeddings=True, convert_to_numpy=True
-            )
+            t0 = time.perf_counter()
+            with StepSampler() as s_emb:
+                embs = embedder.encode(
+                    queries, normalize_embeddings=True, convert_to_numpy=True
+                )
             logger.info(
                 "[Node0] Embedding finished batch_size=%d time=%.3fs",
                 batch_size,
-                time.time() - t0,
+                time.perf_counter() - t0,
             )
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="generate_embeddings",
+                    node_number=0,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=req_ids,
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    rss_samples_mb=getattr(s_emb, 'rss_samples_mb', []),
+                    rss_aggregates=getattr(s_emb, 'rss_aggregates', {})
+                ))
+                metrics.flush()
+            except Exception:
+                pass
 
             # round robin 发送到 FAISS node
             for i, r in enumerate(batch):
@@ -365,46 +558,46 @@ def callback_worker():
             # --------------------------------------------------------
             # 3) fetch documents（批量）
             # --------------------------------------------------------
-            t_fetch = time.time()
+            t_fetch = time.perf_counter()
             all_docs_batch = []
             for doc_ids in doc_ids_batch:
                 all_docs_batch.append(fetch_docs(doc_ids))
             logger.info(
                 "[Node0] Fetch docs batch_size=%d time=%.3fs",
                 batch_size,
-                time.time() - t_fetch,
+                time.perf_counter() - t_fetch,
             )
 
             # --------------------------------------------------------
             # 4) rerank（批量）
             # --------------------------------------------------------
-            t_rerank = time.time()
+            t_rerank = time.perf_counter()
             reranked_batch = []
             for q, docs in zip(queries, all_docs_batch):
                 reranked_batch.append(rerank(q, docs))
             logger.info(
                 "[Node0] Rerank batch_size=%d time=%.3fs",
                 batch_size,
-                time.time() - t_rerank,
+                time.perf_counter() - t_rerank,
             )
 
             # --------------------------------------------------------
             # 5) LLM inference（批量）
             # --------------------------------------------------------
-            t_llm = time.time()
+            t_llm = time.perf_counter()
             answers = []
             for q, docs in zip(queries, reranked_batch):
                 answers.append(llm_generate(q, docs))
             logger.info(
                 "[Node0] LLM batch_size=%d time=%.3fs",
                 batch_size,
-                time.time() - t_llm,
+                time.perf_counter() - t_llm,
             )
 
             # --------------------------------------------------------
             # 6) sentiment + toxicity（批量并行）
             # --------------------------------------------------------
-            t_analysis = time.time()
+            t_analysis = time.perf_counter()
             truncated = [a[:512] for a in answers]
 
             def run_sentiment():
@@ -421,7 +614,7 @@ def callback_worker():
             logger.info(
                 "[Node0] Analysis batch_size=%d time=%.3fs",
                 batch_size,
-                time.time() - t_analysis,
+                time.perf_counter() - t_analysis,
             )
 
             sent_map = {
@@ -443,6 +636,20 @@ def callback_worker():
                 batch_size,
                 time.time() - start_t,
             )
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="node0_total",
+                    node_number=0,
+                    timestamp=time.time(),
+                    batch_size=batch_size,
+                    request_ids=request_ids,
+                    duration_ms=(time.time() - start_t) * 1000.0,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                ))
+                metrics.flush()
+            except Exception:
+                pass
 
             with results_lock:
                 for rid, ans, s, tox in zip(request_ids, answers, sentiments, toxics):
@@ -487,7 +694,22 @@ def query_api():
     while time.time() - start < 300:
         with results_lock:
             if req_id in results:
-                return jsonify(results.pop(req_id)), 200
+                res = results.pop(req_id)
+                try:
+                    metrics.record_step(StepMetrics(
+                        step_name="request_total",
+                        node_number=0,
+                        timestamp=time.time(),
+                        batch_size=1,
+                        request_ids=[req_id],
+                        duration_ms=(time.time() - start) * 1000.0,
+                        rss_samples_mb=[],
+                        rss_aggregates={}
+                    ))
+                    metrics.flush()
+                except Exception:
+                    pass
+                return jsonify(res), 200
         time.sleep(0.05)
 
     return jsonify({"error": "timeout"}), 504
@@ -518,6 +740,20 @@ def retrieval_callback():
         }
     )
 
+    try:
+        metrics.record_step(StepMetrics(
+            step_name="request_queue_wait",
+            node_number=0,
+            timestamp=time.time(),
+            batch_size=1,
+            request_ids=[rid] if rid else [],
+            duration_ms=0.0,
+            rss_samples_mb=[],
+            rss_aggregates={}
+        ))
+        metrics.flush()
+    except Exception:
+        pass
     return jsonify({"status": "queued"}), 200
 
 
@@ -529,6 +765,14 @@ def main():
 
     threading.Thread(target=embed_worker, daemon=True).start()
     threading.Thread(target=callback_worker, daemon=True).start()
+
+    try:
+        global node_monitor
+        node_monitor = NodeMonitor(node_number=0, metrics_file_path=f"metrics_node0.jsonl", sample_interval_s=0.02)
+        node_monitor.start()
+        metrics.start()
+    except Exception:
+        pass
 
     host, port = NODE_0_IP.split(":")
     app.run(host=host, port=int(port), threaded=True)

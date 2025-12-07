@@ -11,6 +11,7 @@ import faiss
 import numpy as np
 from flask import Flask, request, jsonify
 import requests  # ✨ 新增
+from metrics import MetricsCollector, StepSampler, StepMetrics, NodeMonitor
 
 # Configure Logging
 logging.basicConfig(
@@ -38,6 +39,13 @@ MAX_QUEUE_SIZE = 500
 
 # Global state
 request_queue = Queue(maxsize=MAX_QUEUE_SIZE)
+metrics = MetricsCollector(
+    enable_metrics=True,
+    metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl",
+    metrics_summary_file_path=f"metrics_summary_node{NODE_NUMBER}.jsonl",
+    immediate_flush=True,
+)
+node_monitor = None
 
 
 @dataclass
@@ -56,7 +64,24 @@ def load_index():
         sys.exit(1)
 
     try:
-        index = faiss.read_index(FAISS_INDEX_PATH)
+        t0 = time.perf_counter()
+        with StepSampler() as s:
+            index = faiss.read_index(FAISS_INDEX_PATH)
+        t1 = time.perf_counter()
+        try:
+            metrics.record_step(StepMetrics(
+                step_name="faiss_search.load_index",
+                node_number=NODE_NUMBER,
+                timestamp=time.time(),
+                batch_size=0,
+                request_ids=[],
+                duration_ms=(t1 - t0) * 1000.0,
+                rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                rss_aggregates=getattr(s, 'rss_aggregates', {})
+            ))
+            metrics.flush()
+        except Exception:
+            pass
         logger.info("FAISS Index loaded successfully.")
         logger.info(f"   - Vectors: {index.ntotal}")
         logger.info(f"   - Dimensions: {index.d}")
@@ -89,6 +114,21 @@ def worker_loop():
             if first_req is None:  # Shutdown signal
                 break
             batch.append(first_req)
+            # queue wait for first
+            try:
+                metrics.record_step(StepMetrics(
+                    step_name="request_queue_wait",
+                    node_number=NODE_NUMBER,
+                    timestamp=time.time(),
+                    batch_size=1,
+                    request_ids=[first_req["request_id"]],
+                    duration_ms=(time.time() - first_req["timestamp"]) * 1000.0,
+                    rss_samples_mb=[],
+                    rss_aggregates={}
+                ))
+                metrics.flush()
+            except Exception:
+                pass
 
             queue_size = request_queue.qsize()
 
@@ -110,6 +150,21 @@ def worker_loop():
                     if req is None:
                         break
                     batch.append(req)
+                    # queue wait for subsequent
+                    try:
+                        metrics.record_step(StepMetrics(
+                            step_name="request_queue_wait",
+                            node_number=NODE_NUMBER,
+                            timestamp=time.time(),
+                            batch_size=1,
+                            request_ids=[req["request_id"]],
+                            duration_ms=(time.time() - req["timestamp"]) * 1000.0,
+                            rss_samples_mb=[],
+                            rss_aggregates={}
+                        ))
+                        metrics.flush()
+                    except Exception:
+                        pass
                 except Empty:
                     break
 
@@ -182,9 +237,25 @@ def worker_loop():
                 )
                 batch_embeddings = np.vstack(all_embeddings)
 
-                t0 = time.time()
-                _, indices = index.search(batch_embeddings, RETRIEVAL_K)
-                search_time = time.time() - t0
+                t0 = time.perf_counter()
+                with StepSampler() as s:
+                    _, indices = index.search(batch_embeddings, RETRIEVAL_K)
+                t1 = time.perf_counter()
+                search_time = t1 - t0
+                try:
+                    metrics.record_step(StepMetrics(
+                        step_name="faiss_search.search",
+                        node_number=NODE_NUMBER,
+                        timestamp=time.time(),
+                        batch_size=len(all_embeddings),
+                        request_ids=[rid for rid, _ in request_mapping],
+                        duration_ms=(t1 - t0) * 1000.0,
+                        rss_samples_mb=getattr(s, 'rss_samples_mb', []),
+                        rss_aggregates=getattr(s, 'rss_aggregates', {})
+                    ))
+                    metrics.flush()
+                except Exception:
+                    pass
 
                 logger.info(
                     f"Batch search completed in {search_time:.3f}s for {len(all_embeddings)} queries"
@@ -222,6 +293,20 @@ def worker_loop():
                     batch_size,
                     time.time() - batch_start,
                 )
+                try:
+                    metrics.record_step(StepMetrics(
+                        step_name="node2_total",
+                        node_number=NODE_NUMBER,
+                        timestamp=time.time(),
+                        batch_size=batch_size,
+                        request_ids=[req_dict["request_id"] for req_dict in batch],
+                        duration_ms=(time.time() - batch_start) * 1000.0,
+                        rss_samples_mb=[],
+                        rss_aggregates={}
+                    ))
+                    metrics.flush()
+                except Exception:
+                    pass
 
             for _ in batch:
                 request_queue.task_done()
@@ -287,7 +372,14 @@ index = None
 
 
 def main():
+    global node_monitor
     load_index()
+    try:
+        node_monitor = NodeMonitor(node_number=NODE_NUMBER, metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl", sample_interval_s=0.02)
+        node_monitor.start()
+        metrics.start()
+    except Exception:
+        pass
 
     worker_thread = threading.Thread(target=worker_loop, daemon=True)
     worker_thread.start()
