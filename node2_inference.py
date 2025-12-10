@@ -17,7 +17,7 @@ NODE_NUMBER = int(os.environ.get('NODE_NUMBER', 2))
 NODE_2_IP_RAW = os.environ.get('NODE_2_IP', 'localhost:8002')
 
 # Matches the logic in Node 0.
-GPU_MICRO_BATCH_SIZE = int(os.environ.get("GPU_MICRO_BATCH_SIZE", "1"))
+LLM_GEN_MICROBATCH_SIZE = int(os.environ.get("LLM_GEN_MICROBATCH_SIZE", "1"))
 
 # Shared Worker Instance
 worker = None
@@ -176,8 +176,8 @@ def main():
 
     # Initialize the heavy worker once at startup
     # This loads LLM, Reranker, Sentiment, and Safety models
-    logger.info("Initializing Inference Engine...")
-    worker = InferenceWorker(micro_batch_size=GPU_MICRO_BATCH_SIZE)
+    logger.info(f"Initializing Inference Engine (MicroBatch={LLM_GEN_MICROBATCH_SIZE})...")
+    worker = InferenceWorker(micro_batch_size=LLM_GEN_MICROBATCH_SIZE)
 
     try:
         node_monitor = NodeMonitor(node_number=NODE_NUMBER, metrics_file_path=f"metrics_node{NODE_NUMBER}.jsonl", sample_interval_s=0.02)
