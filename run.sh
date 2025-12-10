@@ -8,54 +8,51 @@
 #  Tuned for: 3 Nodes, each with 6 vCPUs (Intel Xeon Gold)
 # =================================================================
 
-# --- CASE 1: LOCAL MAC (M2 Max) CONFIG ---
-# Resource Strategy: Conservative concurrency, High vectorization (MPS loves batches)
+# Default to GPU mode unless explicitly told otherwise
+if [ "$ONLY_CPU" = "true" ]; then
+    MODE="CPU"
+else
+    MODE="GPU"
+fi
 
-#export ONLY_CPU="true"
-#export BATCH_SIZE=16           # Moderate batch size for responsiveness
-#export BATCH_TIMEOUT=0.1
-#export MAX_WORKERS=2           # Limit concurrency: 1 Local Task + 1 Remote Task.
-#                               # Prevents local resource thrashing.
-#
-#export OMP_NUM_THREADS=4       # Not strictly used by MPS, but good fallback
-#export GPU_MICRO_BATCH_SIZE=4  # M2 GPU is powerful; process 4 items at once for speed.
+echo "=================================================="
+echo "Initializing Node $NODE_NUMBER in [$MODE MODE]"
+echo "Hardware: $(nproc) Cores detected."
+echo "=================================================="
 
-
-# --- CASE 2: REMOTE LINUX (CPU ONLY) CONFIG ---
-# Resource Strategy: High concurrency, Serial processing (CPU hates batches)
-export ONLY_CPU="true"
-
-# 1. Pipeline Depth
-# Keep pipeline full (2 Active Compute + 2 Network Wait)
+# --- SHARED SETTINGS ---
+# 4 workers ensure the pipeline stays full (Local + Remote + IO Wait)
+# This works well for both CPU (latency masking) and GPU (throughput).
 export MAX_WORKERS=4
+export BATCH_TIMEOUT=0.1
 
-# 2. CPU Threading (The Critical Fix)
-# Limit PyTorch to 3 cores per task.
-# Since Node 0 runs ~2 tasks locally at once, 2 * 3 = 6 Cores. Perfect fit.
+# Threading: Limit to 50% capacity per worker.
+# Since Node 0/2 run ~2 tasks at once, 2 * 50% = 100% Load.
 export OMP_NUM_THREADS=$(( $(nproc) / 2 ))
 
-# 3. Batching
-export BATCH_SIZE=8
-export BATCH_TIMEOUT=0.1
-# CPU vectorization is poor. Serial processing (1 at a time) is often faster/safer.
-# If you had a T4 GPU, you would set this to 4 or 8.
-export GPU_MICRO_BATCH_SIZE=8
 
+if [ "$MODE" = "CPU" ]; then
+    # --- CPU OPTIMIZATION PROFILE ---
+    # Strategy: Serial processing, smaller batches to reduce latency spikes.
 
-# --- CASE 3: REMOTE LINUX (TESLA T4 GPU) CONFIG ---
-# Resource Strategy: High concurrency, Parallel processing (GPU loves batches)
+    # 1. Network Batching: Moderate size to prevent OS freeze during processing
+    export BATCH_SIZE=8
 
-#export ONLY_CPU="false"
-#export BATCH_SIZE=32           # Large batches to minimize HTTP overhead
-#export BATCH_TIMEOUT=0.1
-#export MAX_WORKERS=4           # Maximize pipeline depth
-#
-## CPU is just a manager here (Kernel launch + Network).
-## 4 threads is plenty safe.
-#export OMP_NUM_THREADS=4
-#
-#export GPU_MICRO_BATCH_SIZE=4  # T4 optimization: Process 4 items in parallel on VRAM
-# =================================================================
+    # 2. Micro-Batching: Serial (1 at a time) is faster on CPU than vectorization
+    export GPU_MICRO_BATCH_SIZE=1
+
+else
+    # --- GPU OPTIMIZATION PROFILE (Tesla T4) ---
+    # Strategy: Parallel processing, massive batches to saturate VRAM.
+
+    # 1. Network Batching: Large batches minimize HTTP overhead
+    export BATCH_SIZE=32
+
+    # 2. Micro-Batching: T4 GPU can handle 4 items in parallel efficiently
+    export GPU_MICRO_BATCH_SIZE=4
+
+fi
+
 
 if [ "$NODE_NUMBER" -eq 0 ]; then
     echo "Starting Node $NODE_NUMBER..."
