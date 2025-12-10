@@ -33,11 +33,9 @@ export OMP_NUM_THREADS=$(( $(nproc) / 2 ))
 
 
 if [ "$MODE" = "CPU" ]; then
-    export LLM_GEN_MICROBATCH_SIZE=8
-
+    export LLM_GEN_MICROBATCH_SIZE=32
 else
     export LLM_GEN_MICROBATCH_SIZE=32
-
 fi
 
 

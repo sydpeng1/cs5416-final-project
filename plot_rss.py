@@ -12,16 +12,16 @@ import matplotlib.pyplot as plt
 
 # Expected pipeline step order
 STEP_ORDER = [
-    "request_queue_wait",
+    # "request_queue_wait",
     "generate_embeddings",
-    "faiss_search.load_index",
+    # "faiss_search.load_index",
     "faiss_search.search",
     "faiss_search.cleanup",
-    # "faiss_search",
+    "faiss_search",
     "fetch_documents",
     "rerank_documents",
     # Fine-grained generate steps if present; otherwise we record aggregate below
-    "generate_responses.load_model",
+    # "generate_responses.load_model",
     "generate_responses.prepare_prompts",
     "generate_responses.tokenize",
     "generate_responses.generate",
@@ -40,7 +40,7 @@ def read_occurrences_from_file(metrics_path: str) -> List[Dict[str, Any]]:
     occurrences = []
     try:
         with open(metrics_path, "r") as f:
-            for line in f:
+            for idx, line in enumerate(f):
                 line = line.strip()
                 if not line:
                     continue
@@ -51,7 +51,10 @@ def read_occurrences_from_file(metrics_path: str) -> List[Dict[str, Any]]:
                 # Support both typed records and raw occurrence lines
                 if obj.get("type") and obj.get("type") != "occurrence":
                     continue
-                occurrences.append(obj if obj.get("type") == "occurrence" else {**obj, "type": "occurrence"})
+                rec = obj if obj.get("type") == "occurrence" else {**obj, "type": "occurrence"}
+                # Attach a fallback unique id for grouping when request_ids are missing
+                rec.setdefault("occurrence_index", idx)
+                occurrences.append(rec)
     except Exception:
         pass
     return occurrences
@@ -82,7 +85,12 @@ def prepare_series_all_samples(occurrences: List[Dict[str, Any]]) -> Dict[str, L
         if step not in STEP_INDEX:
             continue
         rss_samples = occ.get("rss_samples_mb") or []
-        req_ids = occ.get("request_ids", [])
+        req_ids = occ.get("request_ids") or []
+        if not req_ids:
+            # Synthesize a request id when missing
+            ts = occ.get("timestamp", 0)
+            rid = f"req_{int(ts)}_{occ.get('occurrence_index', 0)}"
+            req_ids = [rid]
         for rid in req_ids:
             # extend in case multiple fragments recorded for the same step
             per_req_steps[rid][step].extend([float(x) for x in rss_samples])
@@ -109,7 +117,12 @@ def prepare_durations(occurrences: List[Dict[str, Any]]) -> Dict[str, List[Tuple
         if step not in STEP_INDEX:
             continue
         duration = float(occ.get("duration_ms", 0.0))
-        for rid in occ.get("request_ids", []):
+        req_ids = occ.get("request_ids") or []
+        if not req_ids:
+            ts = occ.get("timestamp", 0)
+            rid = f"req_{int(ts)}_{occ.get('occurrence_index', 0)}"
+            req_ids = [rid]
+        for rid in req_ids:
             per_req_steps[rid][step] = duration
 
     per_req_ordered: Dict[str, List[Tuple[str, float]]] = {}
@@ -117,6 +130,132 @@ def prepare_durations(occurrences: List[Dict[str, Any]]) -> Dict[str, List[Tuple
         ordered = [(step, step_map.get(step, 0.0)) for step in STEP_ORDER if step in step_map]
         per_req_ordered[rid] = ordered
     return per_req_ordered
+
+
+def prepare_duration_distribution(occurrences: List[Dict[str, Any]]) -> Dict[str, List[float]]:
+    """Collect duration lists per step across all occurrences, independent of request ids."""
+    per_step: Dict[str, List[float]] = defaultdict(list)
+    for occ in occurrences:
+        if not {"step_name", "duration_ms"}.issubset(occ.keys()):
+            continue
+        step = occ["step_name"]
+        if step not in STEP_INDEX:
+            continue
+        try:
+            per_step[step].append(float(occ.get("duration_ms", 0.0)))
+        except Exception:
+            continue
+    return per_step
+
+
+def plot_duration_scatter(per_step_durations: Dict[str, List[float]], out_path: str):
+    """Scatter plot showing duration distribution per step.
+
+    Each step is plotted at a distinct x-index, with all its occurrence durations scattered vertically.
+    """
+    steps_present = [s for s in STEP_ORDER if s in per_step_durations and per_step_durations[s]]
+    if not steps_present:
+        return
+    xs = list(range(len(steps_present)))
+    plt.figure(figsize=(12, 5))
+    # jitter points slightly around integer x for visibility
+    for i, step in enumerate(steps_present):
+        durations = per_step_durations[step]
+        if not durations:
+            continue
+        jitter = [i + (0.05 * ((j % 5) - 2)) for j in range(len(durations))]
+        plt.scatter(jitter, durations, alpha=0.7, s=20)
+    abbrev = {
+        'request_queue_wait': 'queue_wait',
+        'generate_embeddings': 'embeddings',
+        'faiss_search.load_index': 'faiss.load',
+        'faiss_search.search': 'faiss.search',
+        'faiss_search.cleanup': 'faiss.clean',
+        'fetch_documents': 'fetch_docs',
+        'rerank_documents': 'rerank',
+        'generate_responses.load_model': 'resp.load',
+        'generate_responses.prepare_prompts': 'resp.prompts',
+        'generate_responses.tokenize': 'resp.tokenize',
+        'generate_responses.generate': 'resp.generate',
+        'generate_responses.decode': 'resp.decode',
+        'generate_responses.cleanup': 'resp.clean',
+        'generate_responses': 'generate_responses',
+        'analyze_sentiment': 'sentiment and safety',
+        'safety_filter': 'safety',
+    }
+    plt.xticks(xs, [abbrev.get(s, s) for s in steps_present], rotation=35, ha='right', fontsize=9)
+    plt.ylabel('Duration (ms)')
+    plt.title('Step Duration Distribution (scatter)')
+    plt.grid(True, axis='y', linestyle='--', alpha=0.4)
+    plt.gcf().subplots_adjust(bottom=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def prepare_rss_distribution(occurrences: List[Dict[str, Any]]) -> Dict[str, List[float]]:
+    """Collect RSS samples per step across all occurrences, independent of request ids.
+
+    Flattens rss_samples_mb arrays into per-step lists.
+    """
+    per_step: Dict[str, List[float]] = defaultdict(list)
+    for occ in occurrences:
+        if not {"step_name", "rss_samples_mb"}.issubset(occ.keys()):
+            continue
+        step = occ["step_name"]
+        if step not in STEP_INDEX:
+            continue
+        try:
+            samples = occ.get("rss_samples_mb") or []
+            for s in samples:
+                per_step[step].append(float(s))
+        except Exception:
+            continue
+    return per_step
+
+
+def plot_rss_scatter(per_step_rss: Dict[str, List[float]], out_path: str):
+    """Scatter plot showing RSS distribution per step.
+
+    Each step is plotted at a distinct x-index, with all its RSS samples scattered vertically.
+    """
+    steps_present = [s for s in STEP_ORDER if s in per_step_rss and per_step_rss[s]]
+    if not steps_present:
+        return
+    xs = list(range(len(steps_present)))
+    plt.figure(figsize=(12, 5))
+    for i, step in enumerate(steps_present):
+        rss_vals = per_step_rss[step]
+        if not rss_vals:
+            continue
+        jitter = [i + (0.05 * ((j % 5) - 2)) for j in range(len(rss_vals))]
+        plt.scatter(jitter, rss_vals, alpha=0.7, s=20)
+    abbrev = {
+        'request_queue_wait': 'queue_wait',
+        'generate_embeddings': 'embeddings',
+        'faiss_search.load_index': 'faiss.load',
+        'faiss_search.search': 'faiss.search',
+        'faiss_search.cleanup': 'faiss.clean',
+        'fetch_documents': 'fetch_docs',
+        'rerank_documents': 'rerank',
+        'generate_responses.load_model': 'resp.load',
+        'generate_responses.prepare_prompts': 'resp.prompts',
+        'generate_responses.tokenize': 'resp.tokenize',
+        'generate_responses.generate': 'resp.generate',
+        'generate_responses.decode': 'resp.decode',
+        'generate_responses.cleanup': 'resp.clean',
+        'generate_responses': 'generate_responses',
+        'analyze_sentiment': 'sentiment',
+        'safety_filter': 'safety',
+    }
+    plt.xticks(xs, [abbrev.get(s, s) for s in steps_present], rotation=35, ha='right', fontsize=9)
+    plt.ylabel('RSS (MB)')
+    plt.title('Step RSS Distribution (scatter)')
+    plt.grid(True, axis='y', linestyle='--', alpha=0.4)
+    plt.gcf().subplots_adjust(bottom=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
 
 def plot_request_all_samples(series: List[Tuple[str, List[float]]], out_path: str, title: str):
@@ -151,7 +290,7 @@ def plot_request_all_samples(series: List[Tuple[str, List[float]]], out_path: st
         'generate_responses.generate': 'resp.generate',
         'generate_responses.decode': 'resp.decode',
         'generate_responses.cleanup': 'resp.clean',
-        'generate_responses': 'responses',
+        'generate_responses': 'generate_responses',
         'analyze_sentiment': 'sentiment',
         'safety_filter': 'safety',
         'request_total': 'total'
@@ -224,7 +363,7 @@ def plot_request_durations(series: List[Tuple[str, float]], out_path: str, title
             'generate_responses.generate': 'resp.generate',
             'generate_responses.decode': 'resp.decode',
             'generate_responses.cleanup': 'resp.clean',
-            'generate_responses': 'responses',
+            'generate_responses': 'generate_responses',
             'analyze_sentiment': 'sentiment',
             'safety_filter': 'safety',
             'request_total': 'total'
@@ -271,49 +410,13 @@ def plot_combined_overlay(per_req: Dict[str, List[Tuple[str, List[float]]]], out
     plt.savefig(out_path)
     plt.close()
 
-
-def plot_combined_durations(per_req_durations: Dict[str, List[Tuple[str, float]]], out_path: str, max_requests: int = 10):
-    """Overlay durations across requests as lines over step indices.
-
-    Each request contributes a line connecting its step durations ordered by STEP_ORDER.
-    """
-    plt.figure(figsize=(10, 5))
-    # Use distinct colors per request for clarity
-    distinct_colors = [
-        '#1f77b4', '#d62728', '#2ca02c', '#ff7f0e', '#9467bd', '#8c564b',
-        '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#000000', '#ff0000',
-        '#00aa00', '#aa00ff', '#ffaa00', '#00ccff', '#ff00aa', '#964B00',
-        '#4B0082', '#228B22'
-    ]
-    # X positions for steps
-    xs = list(range(len(STEP_ORDER)))
-    step_labels = STEP_ORDER
-    for i, (rid, series) in enumerate(per_req_durations.items()):
-        if i >= max_requests:
-            break
-        # Map series to full step order positions; missing steps get 0
-        step_to_duration = {s: d for s, d in series}
-        ys = [step_to_duration.get(s, 0.0) for s in STEP_ORDER]
-        color = distinct_colors[i % len(distinct_colors)]
-        plt.plot(xs, ys, marker='o', linestyle='-', color=color, alpha=0.8, label=rid)
-    plt.xticks(xs, step_labels, rotation=30, ha='right')
-    plt.ylabel('Duration (ms)')
-    plt.title(f'Step Durations Overlay (up to {max_requests} requests)')
-    plt.grid(True, linestyle='--', alpha=0.4)
-    # Limit legend entries to avoid clutter; show up to max_requests
-    handles, labels = plt.gca().get_legend_handles_labels()
-    if handles:
-        plt.legend(handles[:max_requests], labels[:max_requests], loc='best', fontsize=8)
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-
-
 def main():
     ap = argparse.ArgumentParser(description="Plot per-request RSS evolution across pipeline steps.")
     ap.add_argument('--metrics-file', help='Path to a single metrics file (optional). If omitted, auto-detect metrics_node*.jsonl')
+    ap.add_argument('--metrics-dir', help='Directory to search for metrics files (metrics_*.jsonl). If provided, plots will also be written here.')
     ap.add_argument('--output-dir', default='metrics_plots', help='Directory to write plots')
-    ap.add_argument('--combined', action='store_true', help='Produce only a combined overlay plot (no per-request charts)')
+    ap.add_argument('--combined', action='store_true', help='Produce combined overlay plots (defaults to on unless --per-request is set)')
+    ap.add_argument('--per-request', action='store_true', help='Produce per-request plots (disabled by default)')
     ap.add_argument('--max-combined', type=int, default=10, help='Max requests to overlay in combined plot')
     args = ap.parse_args()
 
@@ -321,11 +424,14 @@ def main():
     if args.metrics_file:
         metrics_paths = [args.metrics_file]
     else:
-        # Auto-detect all node metrics files in CWD
-        metrics_paths = sorted(glob.glob('metrics_node*.jsonl'))
+        search_dir = args.metrics_dir if args.metrics_dir else os.getcwd()
+        pattern = os.path.join(search_dir, 'metrics_node*.jsonl')
+        # Auto-detect all node metrics files in provided directory (or CWD)
+        metrics_paths = sorted(glob.glob(pattern))
         # Fallback to legacy name if no node files
-        if not metrics_paths and os.path.exists('metrics.jsonl'):
-            metrics_paths = ['metrics.jsonl']
+        legacy = os.path.join(search_dir, 'metrics.jsonl')
+        if not metrics_paths and os.path.exists(legacy):
+            metrics_paths = [legacy]
 
     if not metrics_paths:
         print("No metrics files found. Looked for metrics_node*.jsonl and metrics.jsonl.")
@@ -338,32 +444,45 @@ def main():
 
     per_req = prepare_series_all_samples(occurrences)
     per_req_durations = prepare_durations(occurrences)
+    per_step_duration_dist = prepare_duration_distribution(occurrences)
+    per_step_rss_dist = prepare_rss_distribution(occurrences)
     if not per_req:
         print("No per-request RSS data available to plot.")
         return
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # If metrics-dir is provided, write plots into that directory
+    output_dir = args.metrics_dir if args.metrics_dir else args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
 
-    if args.combined:
+    # Default behavior: combined plots unless per-request explicitly requested
+    if args.combined or not args.per_request:
         # Combined overlay only
-        out_path = os.path.join(args.output_dir, "rss_combined.png")
+        out_path = os.path.join(output_dir, "rss_combined.png")
         plot_combined_overlay(per_req, out_path, max_requests=args.max_combined)
-        # Also produce combined durations overlay
-        dout = os.path.join(args.output_dir, "durations_combined.png")
-        plot_combined_durations(per_req_durations, dout, max_requests=args.max_combined)
-    else:
+        # And duration scatter distribution per step
+        sout = os.path.join(output_dir, "durations_scatter.png")
+        plot_duration_scatter(per_step_duration_dist, sout)
+        # And RSS scatter distribution per step
+        rsout = os.path.join(output_dir, "rss_scatter.png")
+        plot_rss_scatter(per_step_rss_dist, rsout)
+    if args.per_request:
         # Per-request plots (always include durations)
         for rid, series in per_req.items():
             if not series:
                 continue
-            out_path = os.path.join(args.output_dir, f"rss_request_{rid}.png")
+            out_path = os.path.join(output_dir, f"rss_request_{rid}.png")
             plot_request_all_samples(series, out_path, title=f"RSS Evolution (all samples) for {rid}")
             if rid in per_req_durations:
                 dseries = per_req_durations[rid]
-                dout = os.path.join(args.output_dir, f"durations_request_{rid}.png")
+                dout = os.path.join(output_dir, f"durations_request_{rid}.png")
                 plot_request_durations(dseries, dout, title=f"Step Durations for {rid}")
+        # Also write global scatter distributions
+        sout = os.path.join(output_dir, "durations_scatter.png")
+        plot_duration_scatter(per_step_duration_dist, sout)
+        rsout = os.path.join(output_dir, "rss_scatter.png")
+        plot_rss_scatter(per_step_rss_dist, rsout)
 
-    print(f"Wrote plots to {args.output_dir}")
+    print(f"Wrote plots to {output_dir}")
 
 
 if __name__ == '__main__':

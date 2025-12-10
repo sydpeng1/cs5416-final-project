@@ -156,7 +156,7 @@ class DistributedPipeline:
                 'embeddings': embeddings.tolist(),
                 'request_ids': [r.request_id for r in batch_requests],
             }
-            resp_n1 = requests.post(self.retrieval_url, json=payload_n1, timeout=30)
+            resp_n1 = requests.post(self.retrieval_url, json=payload_n1, timeout=300)
             resp_n1.raise_for_status()
             doc_ids_batch = resp_n1.json()['doc_ids']
             logger.info(f"[2] Retrieval (Node 1): {time.time() - t0:.3f}s")
