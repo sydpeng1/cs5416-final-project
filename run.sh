@@ -32,14 +32,14 @@ export MAX_WORKERS=4
 # 2. CPU Threading (The Critical Fix)
 # Limit PyTorch to 3 cores per task.
 # Since Node 0 runs ~2 tasks locally at once, 2 * 3 = 6 Cores. Perfect fit.
-export OMP_NUM_THREADS=3
+export OMP_NUM_THREADS=$(( $(nproc) / 2 ))
 
 # 3. Batching
 export BATCH_SIZE=8
 export BATCH_TIMEOUT=0.1
 # CPU vectorization is poor. Serial processing (1 at a time) is often faster/safer.
 # If you had a T4 GPU, you would set this to 4 or 8.
-export GPU_MICRO_BATCH_SIZE=1
+export GPU_MICRO_BATCH_SIZE=8
 
 
 # --- CASE 3: REMOTE LINUX (TESLA T4 GPU) CONFIG ---
@@ -63,7 +63,7 @@ if [ "$NODE_NUMBER" -eq 0 ]; then
 
 elif [ "$NODE_NUMBER" -eq 1 ]; then
     echo "Starting Node $NODE_NUMBER..."
-    export OMP_NUM_THREADS=6
+    export OMP_NUM_THREADS=$(nproc)
     exec python3 node1_retrieval.py
 
 elif [ "$NODE_NUMBER" -eq 2 ]; then

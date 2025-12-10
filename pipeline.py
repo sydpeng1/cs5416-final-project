@@ -31,9 +31,9 @@ DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
 # Tuning Parameters
 # Default values are for "Safe Local Dev"
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 BATCH_TIMEOUT = float(os.environ.get("BATCH_TIMEOUT", "0.1"))
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 GPU_MICRO_BATCH_SIZE = int(os.environ.get("GPU_MICRO_BATCH_SIZE", "1"))
 
 # Flask App
