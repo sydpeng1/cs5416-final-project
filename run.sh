@@ -24,6 +24,7 @@ echo "=================================================="
 # 4 workers ensure the pipeline stays full (Local + Remote + IO Wait)
 # This works well for both CPU (latency masking) and GPU (throughput).
 export MAX_WORKERS=4
+export BATCH_SIZE=32
 export BATCH_TIMEOUT=0.1
 
 # Threading: Limit to 50% capacity per worker.
@@ -32,24 +33,10 @@ export OMP_NUM_THREADS=$(( $(nproc) / 2 ))
 
 
 if [ "$MODE" = "CPU" ]; then
-    # --- CPU OPTIMIZATION PROFILE ---
-    # Strategy: Serial processing, smaller batches to reduce latency spikes.
-
-    # 1. Network Batching: Moderate size to prevent OS freeze during processing
-    export BATCH_SIZE=8
-
-    # 2. Micro-Batching: Serial (1 at a time) is faster on CPU than vectorization
-    export GPU_MICRO_BATCH_SIZE=1
+    export LLM_GEN_MICROBATCH_SIZE=8
 
 else
-    # --- GPU OPTIMIZATION PROFILE (Tesla T4) ---
-    # Strategy: Parallel processing, massive batches to saturate VRAM.
-
-    # 1. Network Batching: Large batches minimize HTTP overhead
-    export BATCH_SIZE=32
-
-    # 2. Micro-Batching: T4 GPU can handle 4 items in parallel efficiently
-    export GPU_MICRO_BATCH_SIZE=4
+    export LLM_GEN_MICROBATCH_SIZE=32
 
 fi
 

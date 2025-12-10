@@ -31,10 +31,10 @@ DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
 # Tuning Parameters
 # Default values are for "Safe Local Dev"
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "32"))
 BATCH_TIMEOUT = float(os.environ.get("BATCH_TIMEOUT", "0.1"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
-GPU_MICRO_BATCH_SIZE = int(os.environ.get("GPU_MICRO_BATCH_SIZE", "1"))
+LLM_GEN_MICROBATCH_SIZE = int(os.environ.get("LLM_GEN_MICROBATCH_SIZE", "1"))
 
 # Flask App
 app = Flask(__name__)
@@ -96,8 +96,8 @@ class DistributedPipeline:
         logger.info("Loading Embedder (Local)...")
         self.embedder = SentenceTransformer('BAAI/bge-base-en-v1.5', device=self.device_str)
 
-        logger.info("Loading Local Inference Worker...")
-        self.local_worker = InferenceWorker(micro_batch_size=GPU_MICRO_BATCH_SIZE)
+        logger.info(f"Loading Local Worker (MicroBatch={LLM_GEN_MICROBATCH_SIZE})...")
+        self.local_worker = InferenceWorker(micro_batch_size=LLM_GEN_MICROBATCH_SIZE)
 
         logger.info("Node 0 Ready.")
 
